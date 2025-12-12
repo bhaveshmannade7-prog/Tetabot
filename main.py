@@ -1,170 +1,143 @@
 # main.py
 import os
+import re
+import json
 import requests
 from fastapi import FastAPI, Request
 from pathlib import Path
 import uuid
 import shutil
 
-# ---------------------------
-# ENVIRONMENT VARIABLES
-# ---------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 PUBLIC_URL = os.environ.get("PUBLIC_URL")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is required")
+    raise RuntimeError("BOT_TOKEN required")
 
 TELEGRAM = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
-# Temp folder
-TMP_DIR = Path("/tmp/terabox")
-TMP_DIR.mkdir(exist_ok=True)
+TMP = Path("/tmp/terabox")
+TMP.mkdir(exist_ok=True)
 
 app = FastAPI()
 
 # ---------------------------
-# SUPPORTED MIRROR DOMAINS
+# MIRROR DOMAIN SUPPORT
 # ---------------------------
-VALID_DOMAINS = [
-    "terabox.com",
-    "www.terabox.com",
-    "1024terabox.com",
-    "teraboxapp.com",
-    "teraboxdown.com",
-    "teraboxshare.com",
-    "terasharelink.com",
-    "tibobox.com",
-]
-
-def normalize_link(url: str):
-    """Convert mirror domain → official domain"""
-    url = url.strip()
-    for d in VALID_DOMAINS:
-        if d in url.lower():
-            # Extract ID from any domain format /s/<id>
-            try:
-                base = url.split("/s/")[1]
-                return f"https://terabox.com/s/{base}"
-            except:
-                return url
-    return url
+def normalize(url):
+    """Convert any mirror to main terabox domain"""
+    if "/s/" not in url:
+        return url
+    try:
+        file_id = url.split("/s/")[1]
+        return f"https://terabox.com/s/{file_id}"
+    except:
+        return url
 
 # ---------------------------
 # TELEGRAM HELPERS
 # ---------------------------
-def send_message(chat_id, text):
-    requests.post(
-        f"{TELEGRAM}/sendMessage",
-        json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
-    )
+def send_msg(cid, text):
+    requests.post(f"{TELEGRAM}/sendMessage",
+                  json={"chat_id": cid, "text": text, "parse_mode": "HTML"})
 
-def send_video(chat_id, file_path, caption=None):
-    with open(file_path, "rb") as f:
-        requests.post(
-            f"{TELEGRAM}/sendVideo",
-            data={"chat_id": chat_id, "caption": caption},
-            files={"video": f},
-        )
+def send_vid(cid, path, caption=None):
+    with open(path, "rb") as f:
+        requests.post(f"{TELEGRAM}/sendVideo",
+                      data={"chat_id": cid, "caption": caption},
+                      files={"video": f})
 
-def cleanup():
+# ---------------------------
+# CORE: SCRAPE TERABOX HTML
+# ---------------------------
+def extract_download_urls(url):
+    """Extract working video URLs directly from TeraBox page"""
     try:
-        shutil.rmtree(TMP_DIR)
-        TMP_DIR.mkdir(exist_ok=True)
+        html = requests.get(url, timeout=20).text
     except:
-        pass
+        return None
+
+    # Try extracting jsonData block
+    js_match = re.search(r"window\.jsData\s*=\s*(\{.*?\});", html, re.DOTALL)
+    if not js_match:
+        return None
+
+    try:
+        js_data = json.loads(js_match.group(1))
+    except:
+        return None
+
+    # Possible link locations
+    qualities = {}
+
+    # Highest quality link
+    if "downloadUrl" in js_data:
+        qualities["Original"] = js_data["downloadUrl"]
+
+    # sometimes different key
+    if "normalDownloadUrl" in js_data:
+        qualities["720p"] = js_data["normalDownloadUrl"]
+
+    if "lowDownloadUrl" in js_data:
+        qualities["480p"] = js_data["lowDownloadUrl"]
+
+    # Last fallback: look for dlink token
+    dlink = re.search(r'dlink":"(.*?)"', html)
+    if dlink:
+        qualities["720p"] = dlink.group(1)
+
+    return qualities if qualities else None
 
 # ---------------------------
-# MULTI-API FALLBACK SYSTEM
+# FILE DOWNLOADER
 # ---------------------------
-APIS = [
-    "https://tb.rip/api?url=",
-    "https://api.terabox-link-downloader.xyz/?url=",
-    "https://teraboxdownloader.com/api?url=",
-]
-
-def fetch_video_data(url):
-    """Try multiple APIs until one returns valid result."""
-    for api in APIS:
-        try:
-            r = requests.get(api + url, timeout=20)
-            if r.status_code == 200:
-                j = r.json()
-                if "urls" in j:
-                    return j
-        except:
-            pass
-    return None
-
-# ---------------------------
-# DOWNLOAD FILE
-# ---------------------------
-def download_file(url):
-    filename = f"{uuid.uuid4()}.mp4"
-    filepath = TMP_DIR / filename
-
+def download(url):
+    fname = TMP / f"{uuid.uuid4()}.mp4"
     try:
         with requests.get(url, stream=True, timeout=200) as r:
             r.raise_for_status()
-            with open(filepath, "wb") as f:
+            with open(fname, "wb") as f:
                 for chunk in r.iter_content(1024 * 1024):
                     f.write(chunk)
-        return filepath
+        return fname
     except:
         return None
 
 # ---------------------------
-# TEMP STATE: USER → Quality Map
+# STATE
 # ---------------------------
-user_choice = {}
+pending = {}
 
 # ---------------------------
 # MAIN WEBHOOK
 # ---------------------------
 @app.post("/webhook/{token}")
-async def webhook(token: str, request: Request):
-
+async def main_handler(token, request: Request):
     if token != BOT_TOKEN:
-        return {"error": "Invalid token"}
+        return {"error": "bad token"}
 
-    update = await request.json()
-    message = update.get("message", {})
-    chat_id = message.get("chat", {}).get("id")
-    text = message.get("text", "").strip()
+    data = await request.json()
+    msg = data.get("message", {})
+    cid = msg.get("chat", {}).get("id")
+    text = msg.get("text", "")
 
     if not text:
-        send_message(chat_id, "➡️ TeraBox link bhejo.")
+        send_msg(cid, "➡️ TeraBox link bhejo.")
         return {"ok": True}
 
-    # Normalize (mirror → official)
-    normalized = normalize_link(text)
+    # Normalize any mirror → official
+    link = normalize(text)
 
-    send_message(chat_id, "🔍 Fetching video details...")
+    send_msg(cid, "🔍 Fetching video info...")
 
-    # Fetch from multi-API
-    data = fetch_video_data(normalized)
-    if not data:
-        send_message(chat_id, "❌ Video fetch fail. Ho sakta hai link private ho.")
+    qualities = extract_download_urls(link)
+    if not qualities:
+        send_msg(cid, "❌ Video fetch fail. Link private ya invalid ho sakta hai.")
         return {"ok": True}
 
-    urls = data.get("urls", {})
-    available = {}
+    pending[cid] = qualities
 
-    if "High" in urls:
-        available["720p"] = urls["High"]
-    if "Normal" in urls:
-        available["480p"] = urls["Normal"]
-    if "Original" in urls:
-        available["Original"] = urls["Original"]
-
-    if not available:
-        send_message(chat_id, "❌ No downloadable quality found.")
-        return {"ok": True}
-
-    user_choice[chat_id] = available
-
-    quality_list = "\n".join(f"• {q}" for q in available)
-    send_message(chat_id, f"📥 <b>Select Quality</b>:\n{quality_list}\n\nType the quality (e.g., 720p)")
+    qlist = "\n".join(f"• {k}" for k in qualities)
+    send_msg(cid, f"📥 <b>Select Quality:</b>\n{qlist}\n\nJust type the quality name.")
 
     return {"ok": True}
 
@@ -172,35 +145,36 @@ async def webhook(token: str, request: Request):
 # QUALITY SELECTOR
 # ---------------------------
 @app.post("/webhook/choice/{token}")
-async def quality_handler(token: str, request: Request):
+async def choice_handler(token, request: Request):
     if token != BOT_TOKEN:
-        return {"error": "Invalid token"}
+        return {"error": "bad token"}
 
-    update = await request.json()
-    message = update.get("message", {})
-    chat_id = message.get("chat", {}).get("id")
-    text = message.get("text", "").strip()
+    data = await request.json()
+    msg = data.get("message", {})
+    cid = msg.get("chat", {}).get("id")
+    q = msg.get("text", "").strip()
 
-    if chat_id not in user_choice:
-        send_message(chat_id, "⚠️ Pehle TeraBox link bhejo.")
+    if cid not in pending:
+        send_msg(cid, "⚠️ Pehle TeraBox link bhejo.")
         return {"ok": True}
 
-    qualities = user_choice[chat_id]
-    if text not in qualities:
-        send_message(chat_id, "❌ Invalid quality.\nValid:\n" + "\n".join(qualities))
+    qualities = pending[cid]
+
+    if q not in qualities:
+        send_msg(cid, "❌ Wrong quality.\nValid:\n" + "\n".join(qualities))
         return {"ok": True}
 
-    dl_url = qualities[text]
+    url = qualities[q]
+    send_msg(cid, f"⬇ Downloading <b>{q}</b>...")
 
-    send_message(chat_id, f"⬇ Downloading <b>{text}</b>...")
-
-    file_path = download_file(dl_url)
-    if not file_path:
-        send_message(chat_id, "❌ Download failed.")
+    path = download(url)
+    if not path:
+        send_msg(cid, "❌ Download fail.")
         return {"ok": True}
 
-    send_video(chat_id, file_path, caption=f"TeraBox Video ({text})")
-    cleanup()
+    send_vid(cid, path, caption=f"TeraBox Video ({q})")
+    shutil.rmtree(TMP)
+    TMP.mkdir(exist_ok=True)
 
     return {"ok": True}
 
@@ -208,12 +182,12 @@ async def quality_handler(token: str, request: Request):
 # SET WEBHOOK ON START
 # ---------------------------
 @app.on_event("startup")
-async def startup():
+async def start():
     if PUBLIC_URL:
-        url = f"{PUBLIC_URL}/webhook/{BOT_TOKEN}"
-        requests.get(f"{TELEGRAM}/setWebhook?url={url}")
-        print("Webhook set →", url)
+        wh = f"{PUBLIC_URL}/webhook/{BOT_TOKEN}"
+        requests.get(f"{TELEGRAM}/setWebhook?url={wh}")
+        print("Webhook set:", wh)
 
 @app.get("/")
 def home():
-    return {"status": "TeraBox Bot Running"}
+    return {"status": "running"}
