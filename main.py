@@ -1,12 +1,9 @@
 import os
 import subprocess
-import uuid
-import shutil
 import requests
-from pathlib import Path
 from fastapi import FastAPI, Request
 
-# ================= ENV =================
+# =============== ENV =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 PUBLIC_URL = os.environ.get("PUBLIC_URL")
 
@@ -15,13 +12,10 @@ if not BOT_TOKEN:
 
 TELEGRAM = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-BASE_DIR = Path("/tmp/downloads")
-BASE_DIR.mkdir(exist_ok=True)
-
 app = FastAPI()
 pending = {}  # chat_id -> youtube_url
 
-# ================= Telegram Helpers =================
+# =============== Telegram helpers =================
 def send_message(chat_id, text):
     requests.post(
         f"{TELEGRAM}/sendMessage",
@@ -29,71 +23,33 @@ def send_message(chat_id, text):
         timeout=20
     )
 
-def send_file(chat_id, file_path, caption=None):
-    with open(file_path, "rb") as f:
-        requests.post(
-            f"{TELEGRAM}/sendDocument",
-            data={"chat_id": chat_id, "caption": caption or ""},
-            files={"document": f},
-            timeout=600
-        )
-
-# ================= FFMPEG FIX =================
-def ensure_ffmpeg():
-    if shutil.which("ffmpeg"):
-        return "ffmpeg"
-
-    ffmpeg_path = "/tmp/ffmpeg"
-    if not os.path.exists(ffmpeg_path):
-        os.system(
-            "curl -L https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz "
-            "| tar -xJ --strip-components=1 -C /tmp"
-        )
-    return ffmpeg_path
-
-FFMPEG = ensure_ffmpeg()
-
-# ================= Downloaders =================
-def download_youtube(url, choice):
-    out = BASE_DIR / f"{uuid.uuid4()}.%(ext)s"
-
+# =============== yt-dlp helpers =================
+def get_youtube_link(url, choice):
     if choice == "audio":
-        cmd = [
-            "yt-dlp",
-            "-f", "bestaudio",
-            "--extract-audio",
-            "--audio-format", "mp3",
-            "--ffmpeg-location", FFMPEG,
-            "-o", str(out),
-            url
-        ]
+        cmd = ["yt-dlp", "-f", "bestaudio", "-g", url]
     else:
         height = "360" if choice == "360" else "720"
-        cmd = [
-            "yt-dlp",
-            "-f", f"best[height<={height}]",
-            "--merge-output-format", "mp4",
-            "--ffmpeg-location", FFMPEG,
-            "-o", str(out),
-            url
-        ]
+        cmd = ["yt-dlp", "-f", f"best[height<={height}]", "-g", url]
 
-    subprocess.run(cmd, check=True)
-    return list(BASE_DIR.glob("*"))[-1]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True
+    )
 
-def download_instagram(url):
-    out = BASE_DIR / f"{uuid.uuid4()}.mp4"
-    cmd = [
-        "yt-dlp",
-        "-f", "best",
-        "--ffmpeg-location", FFMPEG,
-        "-o", str(out),
-        url
-    ]
-    subprocess.run(cmd, check=True)
-    return out
+    if result.returncode != 0:
+        return None
 
-# ================= Webhook =================
+    return result.stdout.strip().split("\n")[0]
+
+def get_instagram_link(url):
+    cmd = ["yt-dlp", "-f", "best", "-g", url]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip().split("\n")[0]
+
+# =============== Webhook =================
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
     if token != BOT_TOKEN:
@@ -107,7 +63,7 @@ async def webhook(token: str, request: Request):
     if not chat_id or not text:
         return {"ok": True}
 
-    # YouTube
+    # YouTube link
     if "youtube.com" in text or "youtu.be" in text:
         pending[chat_id] = text
         send_message(
@@ -116,38 +72,48 @@ async def webhook(token: str, request: Request):
         )
         return {"ok": True}
 
-    # Instagram
+    # Instagram link
     if "instagram.com" in text:
-        send_message(chat_id, "⬇ Downloading Instagram video...")
-        try:
-            file = download_instagram(text)
-            send_file(chat_id, file, "Instagram Video")
-            file.unlink(missing_ok=True)
-        except Exception as e:
-            send_message(chat_id, "❌ Instagram download failed")
+        send_message(chat_id, "🔎 Extracting direct link...")
+        link = get_instagram_link(text)
+        if link:
+            send_message(chat_id, f"✅ Direct Download Link:\n{link}")
+        else:
+            send_message(
+                chat_id,
+                "❌ Link extract failed.\n(Login required or rate-limit)"
+            )
         return {"ok": True}
 
-    # YouTube choice
+    # YouTube format selection
     if chat_id in pending and text.lower() in ["360", "720", "audio"]:
         url = pending.pop(chat_id)
-        send_message(chat_id, "⬇ Downloading...")
-        try:
-            file = download_youtube(url, text.lower())
-            send_file(chat_id, file, "YouTube Download")
-            file.unlink(missing_ok=True)
-        except Exception as e:
-            send_message(chat_id, "❌ YouTube download failed")
+        send_message(chat_id, "🔎 Generating direct link...")
+        link = get_youtube_link(url, text.lower())
+        if link:
+            send_message(
+                chat_id,
+                f"✅ Direct Download Link ({text.upper()}):\n{link}"
+            )
+        else:
+            send_message(
+                chat_id,
+                "❌ Link extract failed (bot-detection / rate-limit)."
+            )
         return {"ok": True}
 
     send_message(chat_id, "❌ Unsupported link")
     return {"ok": True}
 
-# ================= Startup =================
+# =============== Startup =================
 @app.on_event("startup")
 async def startup():
     if PUBLIC_URL:
         webhook = f"{PUBLIC_URL}/webhook/{BOT_TOKEN}"
-        requests.get(f"{TELEGRAM}/setWebhook?url={webhook}", timeout=10)
+        requests.get(
+            f"{TELEGRAM}/setWebhook?url={webhook}",
+            timeout=10
+        )
 
 @app.get("/")
 def home():
