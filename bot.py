@@ -15,16 +15,16 @@ from telegram.ext import (
 )
 
 # ==============================================================================
-# 🛠️ USER CONFIGURATION (TUNED FOR HDHUB4U & 9xHD)
+# 🛠️ USER CONFIGURATION (REVERTED TO BROAD SELECTORS)
 # ==============================================================================
 SITE_CONFIG = {
-    # 1. Sirf Main Content Area me search karega (Sidebar ignore)
-    "SEARCH_ITEM_SELECTOR": "div#content div.latestPost article, div.main-content article, div.post-listing article", 
+    # Wapas broad selectors taaki search result miss na ho
+    "SEARCH_ITEM_SELECTOR": "article, div.post, div.latestPost article, ul.recent-movies li, li.post-item, div.result-item", 
     
-    # 2. Title extraction selectors
-    "SEARCH_TITLE_SELECTOR": "h2.title, h2.entry-title, a[title]",
+    # Title extraction
+    "SEARCH_TITLE_SELECTOR": "h2.title, h2.entry-title, p.title, .caption, a",
     
-    # 3. Quality Buttons
+    # Buttons
     "QUALITY_BUTTON_SELECTOR": "a.buttn, a.btn, a.download-link, a.button"
 }
 
@@ -55,7 +55,7 @@ except (ValueError, TypeError):
 SELECT_MOVIE, SELECT_QUALITY = range(2)
 
 # ==============================================================================
-# 2. SMART CLOUDSCRAPER ENGINE
+# 2. ROBUST SCRAPER ENGINE
 # ==============================================================================
 class SmartScraper:
     def __init__(self):
@@ -66,14 +66,17 @@ class SmartScraper:
     def _safe_get(self, url):
         try:
             response = self.scraper.get(url, timeout=REQUEST_TIMEOUT)
-            if response.status_code != 200:
+            # 404 ya errors ko ignore karke aage badho agar content hai
+            if response.status_code not in [200, 404]: 
                 return {"error": f"HTTP {response.status_code}"}
             
             soup = BeautifulSoup(response.text, 'html.parser')
-            # Check for Cloudflare block
             title = soup.title.string if soup.title else ""
+            
+            # Cloudflare Check
             if "Just a moment" in title or "Attention Required" in title:
                 return {"error": "Blocked by Cloudflare", "url": url}
+                
             return {"soup": soup, "url": response.url}
         except Exception as e:
             return {"error": str(e)}
@@ -91,20 +94,17 @@ class SmartScraper:
         soup = result["soup"]
         movies = []
         
-        # Use Specific Selectors to avoid Sidebar garbage
+        # 1. Broad Selection (Sab kuch utha lo)
         items = soup.select(SITE_CONFIG["SEARCH_ITEM_SELECTOR"])
         
-        # Fallback if specific selector fails (generic search)
-        if not items:
-            items = soup.select("article, div.post")
+        # Debugging: Log kitne items mile
+        print(f"DEBUG: Scraper found {len(items)} raw items on page.")
 
-        print(f"DEBUG: Found {len(items)} items.")
-
-        for item in items[:15]:
+        for item in items[:20]: # Check top 20 items
             link_tag = item.find('a', href=True)
             if not link_tag: continue
 
-            # Smart Title Extraction
+            # Title Dhoondo
             title = ""
             title_tag = item.select_one(SITE_CONFIG["SEARCH_TITLE_SELECTOR"])
             
@@ -118,10 +118,11 @@ class SmartScraper:
 
             url = link_tag['href']
             
-            # STRICT FILTER: Query must be somewhat present in title
-            # This fixes "Inaccurate Results"
+            # 2. Python-Side Filtering (Ye important hai accuracy ke liye)
             if title and len(title) > 2 and url:
-                # Split query words and check if ANY word matches (Simple Fuzzy)
+                # Query ke words title me match karke dekho
+                # Example: Query "Avengers" -> Title "Avengers Endgame" (Match!)
+                # Example: Query "Avengers" -> Title "Download App" (No Match!)
                 query_words = query.lower().split()
                 if any(word in title.lower() for word in query_words):
                     movies.append({"title": title, "url": url})
@@ -141,9 +142,11 @@ class SmartScraper:
         if "error" in result: return result
         soup = result["soup"]
         qualities = []
-        target_keywords = ["480p", "720p", "1080p", "2160p", "4k", "hevc", "download", "link"]
+        target_keywords = ["480p", "720p", "1080p", "2160p", "4k", "hevc", "download", "link", "watch"]
         
         links = soup.select(SITE_CONFIG["QUALITY_BUTTON_SELECTOR"])
+        
+        # Fallback to scanning all links if buttons missing
         if not links:
             content_div = soup.select_one("div.entry-content")
             links = content_div.find_all('a', href=True) if content_div else soup.find_all('a', href=True)
@@ -153,8 +156,8 @@ class SmartScraper:
             text = a.get_text(strip=True).lower()
             href = a['href']
             
-            # Ignore common garbage links
-            if "category" in href or "tag" in href or href == "/" or "#" in href: continue
+            # Junk Filter
+            if "category" in href or "tag" in href or href == "/" or "facebook" in href: continue
             
             if any(k in text for k in target_keywords):
                 label = a.get_text(strip=True)[:50]
@@ -165,37 +168,29 @@ class SmartScraper:
 
     def extract_telegram_link(self, quality_url):
         try:
-            # Follow redirects to reach the final landing page
             response = self.scraper.get(quality_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
             soup = BeautifulSoup(response.text, 'html.parser')
         except Exception as e:
             return {"error": str(e)}
 
-        # Regex for Deep Links (t.me/channel/123) - PRIORITY 1
         deep_link_pattern = re.compile(r'(https?://t\.me/[a-zA-Z0-9_]+/[0-9]+)')
-        # Regex for Channel Links (t.me/channel) - PRIORITY 2
-        channel_link_pattern = re.compile(r'(https?://t\.me/[a-zA-Z0-9_]+)')
-
-        # Collect all links
+        
         all_hrefs = [a['href'] for a in soup.find_all('a', href=True)]
         
-        # 1. Look for Deep Links (Files) first
+        # 1. Deep Link Priority
         for link in all_hrefs:
             if deep_link_pattern.search(link):
-                print(f"DEBUG: Found Deep Link: {link}")
                 return {"tg_link": link}
         
-        # 2. Look in Raw Text for Deep Links
+        # 2. Deep Link in Text
         text_deep = deep_link_pattern.findall(str(soup))
         if text_deep:
             return {"tg_link": text_deep[0]}
 
-        # 3. Fallback: Channel Links (Only if no deep link found)
-        # We try to avoid "Join Channel" links by checking text context if possible, 
-        # but for now, we just pick the first non-generic one.
+        # 3. Channel Link Fallback (Exclude JoinChat/Official wrappers if possible)
         for link in all_hrefs:
             if "t.me/" in link and "joinchat" not in link:
-                return {"tg_link": link}
+                 return {"tg_link": link}
 
         return {"error": "No valid Telegram file link found."}
 
@@ -212,7 +207,7 @@ async def restricted(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await restricted(update, context): return
-    await update.message.reply_text("👋 <b>Smart Bot Ready!</b>\nFixed: Accuracy & Dead Links.", parse_mode='HTML')
+    await update.message.reply_text("👋 <b>Bot Ready!</b>\nSelectors Reset & Logic Improved.", parse_mode='HTML')
 
 async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await restricted(update, context): return
@@ -224,8 +219,10 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(results, dict) and "error" in results:
         await update.message.reply_text(f"⚠️ Error: {results['error']}")
         return ConversationHandler.END
+        
     if not results:
-        await update.message.reply_text("❌ No relevant movies found.")
+        # Fallback message
+        await update.message.reply_text("❌ No relevant movies found.\nTry a simpler keyword.")
         return ConversationHandler.END
 
     keyboard = []
@@ -240,7 +237,7 @@ async def movie_selection_handler(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     idx = int(query.data.split("_")[1])
     movie_url = context.user_data.get(f"movie_{idx}")
-    await query.edit_message_text(f"⏳ Finding Qualities...")
+    await query.edit_message_text(f"⏳ Scanning Qualities...")
     qualities = scraper.get_qualities(movie_url)
 
     if not qualities or (isinstance(qualities, dict) and "error" in qualities):
@@ -263,17 +260,16 @@ async def quality_selection_handler(update: Update, context: ContextTypes.DEFAUL
         return ConversationHandler.END
     idx = int(query.data.split("_")[1])
     qual_url = context.user_data.get(f"qual_{idx}")
-    await query.edit_message_text("🕵️‍♂️ Extracting File Link...")
+    await query.edit_message_text("🕵️‍♂️ Fetching File Link...")
     result = scraper.extract_telegram_link(qual_url)
     if "error" in result:
         await query.edit_message_text(f"❌ {result['error']}")
         return ConversationHandler.END
     
-    # Show the specific link found
     tg_link = result["tg_link"]
     await query.edit_message_text(
-        f"✅ <b>Link Found!</b>\n\nTap to open:", 
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 Open Telegram File", url=tg_link)]]),
+        f"✅ <b>Link Found!</b>", 
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 Open Link", url=tg_link)]]),
         parse_mode="HTML"
     )
     return ConversationHandler.END
@@ -307,4 +303,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-        
