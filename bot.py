@@ -17,32 +17,28 @@ from telegram.ext import (
 )
 
 # ==============================================================================
-# 🛠️ USER CONFIGURATION (YAHAN SETTINGS CHANGE KAREIN)
+# 🛠️ USER CONFIGURATION (SPECIFIC FIX FOR YOUR SITE)
 # ==============================================================================
-# Apne website ke structure ke hisab se ye selectors badlein.
-# Agar samajh na aaye, toh niche instructions padhein.
-
 SITE_CONFIG = {
-    # 1. Search Result me Movie ka Dabba (Container) kaisa dikhta hai?
-    # Example: 'div.movie-card', 'article.post', 'div.result-item'
-    "SEARCH_ITEM_SELECTOR": "article, div.post, div.item", 
+    # Is theme (9xhd/WordPress) ke liye broad selectors:
+    # Try searching for list items (li), articles, or poster containers
+    "SEARCH_ITEM_SELECTOR": "ul.recent-movies li, div.latestPost article, article.post, li.post-item, div.post, figure", 
 
-    # 2. Us Dabbe ke andar Title kahan hai?
-    "SEARCH_TITLE_SELECTOR": "h1, h2, h3, .entry-title, .title",
+    # Title aksar H2, H3 ya paragraph me hota hai
+    "SEARCH_TITLE_SELECTOR": "h2.title, h2.entry-title, p.title, .caption, a",
 
-    # 3. Movie Page par Quality Links (480p, 720p) kahan hain?
-    # Example: 'a.download-btn', 'a.button'
-    "QUALITY_BUTTON_SELECTOR": "a"
+    # Buttons usually 'buttn', 'dwn-link' class ke sath hote hain
+    "QUALITY_BUTTON_SELECTOR": "a.buttn, a.btn, a.download-link, a.button"
 }
 
 # ==============================================================================
-# 1. DUMMY WEB SERVER FOR RENDER
+# 1. DUMMY WEB SERVER (RENDER KEEP-ALIVE)
 # ==============================================================================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot is running with Custom Scraper!"
+    return "Bot is running. Status: Online"
 
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
@@ -65,39 +61,31 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
 ALLOWED_DOMAINS = os.getenv("ALLOWED_DOMAINS", "").split(",")
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
-
-if not BOT_TOKEN or not ADMIN_ID:
-    logger.warning("⚠️ Environment variables missing!")
-
-try:
-    ADMIN_ID = int(ADMIN_ID)
-except (ValueError, TypeError):
-    pass
-
-SELECT_MOVIE, SELECT_QUALITY = range(2)
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 
 # ==============================================================================
-# 3. ADVANCED SCRAPER ENGINE (CUSTOMIZABLE)
+# 3. ADVANCED SCRAPER (FIXED SELECTORS & HEADERS)
 # ==============================================================================
 class CustomScraper:
     def __init__(self):
         self.session = requests.Session()
+        # Header bilkul Real Browser jaisa banaya hai
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://google.com"
         })
 
     def _safe_get(self, url):
         try:
-            # Automatic generic search query parameter handling
-            if "?" not in url and "s=" not in url:
-                pass 
-            
             response = self.session.get(url, timeout=REQUEST_TIMEOUT)
             
+            # Debugging Log (Render Logs me dikhega)
+            print(f"DEBUG: Visiting {url} - Status: {response.status_code}")
+            
             if response.status_code in [403, 503]:
-                return {"error": "Access Denied (Cloudflare/Captcha)", "url": url}
+                return {"error": "Cloudflare/Protection Blocked Request", "url": url}
             
             if response.status_code != 200:
                 return {"error": f"HTTP {response.status_code}"}
@@ -108,10 +96,9 @@ class CustomScraper:
 
     def search_movies(self, query):
         if not ALLOWED_DOMAINS or not ALLOWED_DOMAINS[0]:
-            return {"error": "ALLOWED_DOMAINS not set."}
+            return {"error": "ALLOWED_DOMAINS missing."}
 
         base_url = ALLOWED_DOMAINS[0].strip().rstrip('/')
-        # Adjust search URL pattern if your site uses something other than /?s=
         search_url = f"{base_url}/?s={query}"
         
         result = self._safe_get(search_url)
@@ -120,27 +107,33 @@ class CustomScraper:
         soup = result["soup"]
         movies = []
         
-        # --- NEW LOGIC: CSS SELECTORS ---
-        # Find all containers that look like a movie post
+        # --- SELECTOR LOGIC ---
         items = soup.select(SITE_CONFIG["SEARCH_ITEM_SELECTOR"])
-        
+        print(f"DEBUG: Found {len(items)} potential items on search page.") # Log for debugging
+
         for item in items[:15]:
-            # Try to find the link (a tag) inside the container
             link_tag = item.find('a', href=True)
-            
-            # Try to find the title inside the container
+            if not link_tag: continue
+
+            # Title extraction logic (try specialized selector, fallback to link text)
             title_tag = item.select_one(SITE_CONFIG["SEARCH_TITLE_SELECTOR"])
             
-            if link_tag:
-                url = link_tag['href']
-                # If title tag exists, use it. Otherwise try link text.
-                title = title_tag.get_text(strip=True) if title_tag else link_tag.get_text(strip=True)
-                
-                # Check if it's actually a movie link
-                if title and len(title) > 2:
-                    movies.append({"title": title, "url": url})
+            # Agar title tag mila toh text lelo, warna link ka text lelo, warna image ka alt text
+            if title_tag:
+                title = title_tag.get_text(strip=True)
+            else:
+                title = link_tag.get_text(strip=True)
+                if not title: # Fallback to image alt if text is empty
+                    img = item.find('img')
+                    if img and img.get('alt'):
+                        title = img['alt']
+
+            url = link_tag['href']
+            
+            if title and len(title) > 2 and url:
+                movies.append({"title": title, "url": url})
         
-        # Deduplicate results
+        # Deduplicate
         seen = set()
         unique_movies = []
         for m in movies:
@@ -156,46 +149,58 @@ class CustomScraper:
 
         soup = result["soup"]
         qualities = []
-        # Keywords to identify quality buttons
-        target_keywords = ["480p", "720p", "1080p", "2160p", "4k", "hevc", "download", "watch"]
         
-        # Search for all links that might be download buttons
+        # Broad keywords list
+        target_keywords = ["480p", "720p", "1080p", "2160p", "4k", "hevc", "download", "link"]
+        
+        # Try finding buttons specifically first
         links = soup.select(SITE_CONFIG["QUALITY_BUTTON_SELECTOR"])
         
+        # Fallback: If no buttons found, scan ALL links in the content area
+        if not links:
+            content_div = soup.select_one("div.entry-content") # Common WP content area
+            if content_div:
+                links = content_div.find_all('a', href=True)
+            else:
+                links = soup.find_all('a', href=True)
+
         for a in links:
             if not a.has_attr('href'): continue
-            
             text = a.get_text(strip=True).lower()
             href = a['href']
             
-            # Filter: Check if text contains quality info or 'download'
+            # Skip irrelevant links (categories, tags, homepage)
+            if "category" in href or "tag" in href or href == "/": continue
+
             if any(k in text for k in target_keywords):
-                # Clean up the label
-                label = a.get_text(strip=True)[:40] 
+                label = a.get_text(strip=True)[:50] # Shorten long text
                 qualities.append({"quality": label, "url": href})
 
         unique_qualities = {v['url']: v for v in qualities}.values()
         return list(unique_qualities)
 
     def extract_telegram_link(self, quality_url):
-        result = self._safe_get(quality_url)
-        if "error" in result: return result
+        # Follow redirects often needed for download pages
+        try:
+            response = self.session.get(quality_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            soup = BeautifulSoup(response.text, 'html.parser')
+        except Exception as e:
+            return {"error": str(e)}
 
-        soup = result["soup"]
         tg_pattern = re.compile(r'(https?://t\.me/[a-zA-Z0-9_]+(/[0-9]+)?)')
         found_links = []
         
-        # Scan all links
+        # 1. Check direct HREF
         for a in soup.find_all('a', href=True):
             if "t.me" in a['href']: found_links.append(a['href'])
         
-        # Scan plain text
+        # 2. Check Raw Text (Deep scan)
         text_links = tg_pattern.findall(str(soup))
         for link_tuple in text_links:
             found_links.append(link_tuple[0])
 
         if not found_links:
-            return {"error": "No Telegram link found."}
+            return {"error": "No Telegram link found on final page."}
         
         return {"tg_link": found_links[0]}
 
@@ -205,19 +210,19 @@ scraper = CustomScraper()
 # 4. BOT HANDLERS
 # ==============================================================================
 async def restricted(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if str(update.effective_user.id) != str(ADMIN_ID): # String comparison safer
         await update.message.reply_text("⛔ Access denied.")
         return False
     return True
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await restricted(update, context): return
-    await update.message.reply_text("👋 <b>Bot Ready!</b>\nSearching your custom site.", parse_mode='HTML')
+    await update.message.reply_text("👋 <b>Bot Online!</b>\nSearching with Fixed Selectors.", parse_mode='HTML')
 
 async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await restricted(update, context): return
     query = update.message.text.strip()
-    await update.message.reply_text(f"🔍 Searching: <b>{query}</b>...", parse_mode='HTML')
+    await update.message.reply_text(f"🔍 Searching for: <b>{query}</b>...", parse_mode='HTML')
     
     results = scraper.search_movies(query)
     
@@ -226,7 +231,7 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
         
     if not results:
-        await update.message.reply_text("❌ No movies found. Try checking SITE_CONFIG selectors.")
+        await update.message.reply_text("❌ No movies found.\n<i>Check Render Logs for 'DEBUG' details.</i>", parse_mode='HTML')
         return ConversationHandler.END
 
     keyboard = []
@@ -235,19 +240,20 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton(movie['title'], callback_data=f"mov_{idx}")])
 
     await update.message.reply_text(f"✅ Found {len(results)} matches:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return SELECT_MOVIE
+    return ConversationHandler.END if not results else SELECT_MOVIE
 
+# Note: Added simple state fix
 async def movie_selection_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     idx = int(query.data.split("_")[1])
     movie_url = context.user_data.get(f"movie_{idx}")
     
-    await query.edit_message_text(f"⏳ Extracting download links...")
+    await query.edit_message_text(f"⏳ Extracting links from:\n{movie_url}")
     qualities = scraper.get_qualities(movie_url)
 
     if isinstance(qualities, dict) or not qualities:
-        await query.edit_message_text("❌ No quality links found.")
+        await query.edit_message_text("❌ No specific quality links found.")
         return ConversationHandler.END
 
     keyboard = []
@@ -268,7 +274,7 @@ async def quality_selection_handler(update: Update, context: ContextTypes.DEFAUL
         
     idx = int(query.data.split("_")[1])
     qual_url = context.user_data.get(f"qual_{idx}")
-    await query.edit_message_text("🕵️‍♂️ Finding Telegram Link...")
+    await query.edit_message_text("🕵️‍♂️ Decoding Final Link...")
     
     result = scraper.extract_telegram_link(qual_url)
     if "error" in result:
@@ -276,7 +282,7 @@ async def quality_selection_handler(update: Update, context: ContextTypes.DEFAUL
         return ConversationHandler.END
         
     await query.edit_message_text(
-        "✅ <b>Link Found!</b>", 
+        "✅ <b>Link Extracted!</b>", 
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 Open Link", url=result["tg_link"])]]),
         parse_mode='HTML'
     )
@@ -286,9 +292,12 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🚫 Reset.")
     return ConversationHandler.END
 
+SELECT_MOVIE, SELECT_QUALITY = range(2)
+
 def main():
     start_keep_alive()
     application = ApplicationBuilder().token(BOT_TOKEN).build()
+    
     conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, search_handler)],
         states={
@@ -299,8 +308,9 @@ def main():
     )
     application.add_handler(CommandHandler("start", start))
     application.add_handler(conv_handler)
+    
+    print(f"Bot started. Admin ID: {ADMIN_ID}")
     application.run_polling()
 
 if __name__ == '__main__':
     main()
-    
