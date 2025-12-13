@@ -15,21 +15,16 @@ from telegram.ext import (
 )
 
 # ==============================================================================
-# 🛠️ USER CONFIGURATION (REVERTED TO BROAD SELECTORS)
+# 🛠️ USER CONFIGURATION (BROADEST SELECTORS)
 # ==============================================================================
 SITE_CONFIG = {
-    # Wapas broad selectors taaki search result miss na ho
-    "SEARCH_ITEM_SELECTOR": "article, div.post, div.latestPost article, ul.recent-movies li, li.post-item, div.result-item", 
-    
-    # Title extraction
-    "SEARCH_TITLE_SELECTOR": "h2.title, h2.entry-title, p.title, .caption, a",
-    
-    # Buttons
-    "QUALITY_BUTTON_SELECTOR": "a.buttn, a.btn, a.download-link, a.button"
+    # Ab hum specific div nahi dhoondenge, seedha Links aur Titles uthayenge
+    "SEARCH_ITEM_SELECTOR": "article, div.post, li, div.result-item, div.latestPost, div.item", 
+    "QUALITY_BUTTON_SELECTOR": "a" # Check ALL links for quality
 }
 
 # ==============================================================================
-# 1. CONFIGURATION & LOGGING
+# 1. CONFIGURATION
 # ==============================================================================
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -45,7 +40,7 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 PORT = int(os.environ.get("PORT", "10000"))
 
 if not BOT_TOKEN or not WEBHOOK_URL:
-    logger.critical("⚠️ BOT_TOKEN or WEBHOOK_URL missing!")
+    logger.critical("⚠️ CONFIG MISSING")
 
 try:
     ADMIN_ID = int(ADMIN_ID)
@@ -55,9 +50,9 @@ except (ValueError, TypeError):
 SELECT_MOVIE, SELECT_QUALITY = range(2)
 
 # ==============================================================================
-# 2. ROBUST SCRAPER ENGINE
+# 2. SCRAPER ENGINE (UNFILTERED & AGGRESSIVE)
 # ==============================================================================
-class SmartScraper:
+class AggressiveScraper:
     def __init__(self):
         self.scraper = cloudscraper.create_scraper(
             browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
@@ -66,25 +61,17 @@ class SmartScraper:
     def _safe_get(self, url):
         try:
             response = self.scraper.get(url, timeout=REQUEST_TIMEOUT)
-            # 404 ya errors ko ignore karke aage badho agar content hai
-            if response.status_code not in [200, 404]: 
-                return {"error": f"HTTP {response.status_code}"}
-            
             soup = BeautifulSoup(response.text, 'html.parser')
-            title = soup.title.string if soup.title else ""
-            
-            # Cloudflare Check
-            if "Just a moment" in title or "Attention Required" in title:
-                return {"error": "Blocked by Cloudflare", "url": url}
-                
+            # Check Cloudflare
+            if "Just a moment" in str(soup.title):
+                return {"error": "Cloudflare Blocked", "url": url}
             return {"soup": soup, "url": response.url}
         except Exception as e:
             return {"error": str(e)}
 
     def search_movies(self, query):
-        if not ALLOWED_DOMAINS or not ALLOWED_DOMAINS[0]:
-            return {"error": "ALLOWED_DOMAINS missing."}
-
+        if not ALLOWED_DOMAINS: return {"error": "Domain missing"}
+        
         base_url = ALLOWED_DOMAINS[0].strip().rstrip('/')
         search_url = f"{base_url}/?s={query}"
         
@@ -94,37 +81,37 @@ class SmartScraper:
         soup = result["soup"]
         movies = []
         
-        # 1. Broad Selection (Sab kuch utha lo)
-        items = soup.select(SITE_CONFIG["SEARCH_ITEM_SELECTOR"])
+        # METHOD 1: Look for any link that looks like a movie post
+        # Hum page ke saare links scan karenge jo 'title' attribute rakhte hain
+        all_links = soup.find_all('a', href=True)
         
-        # Debugging: Log kitne items mile
-        print(f"DEBUG: Scraper found {len(items)} raw items on page.")
+        print(f"DEBUG: Found {len(all_links)} total links on page.")
 
-        for item in items[:20]: # Check top 20 items
-            link_tag = item.find('a', href=True)
-            if not link_tag: continue
-
-            # Title Dhoondo
+        for a in all_links:
             title = ""
-            title_tag = item.select_one(SITE_CONFIG["SEARCH_TITLE_SELECTOR"])
+            url = a['href']
             
-            if title_tag:
-                title = title_tag.get_text(strip=True)
+            # Title extraction attempts
+            if a.get('title'):
+                title = a['title']
+            elif a.find('img') and a.find('img').get('alt'):
+                title = a.find('img')['alt']
             else:
-                title = link_tag.get_text(strip=True)
-                if not title:
-                    img = item.find('img')
-                    if img: title = img.get('alt')
+                title = a.get_text(strip=True)
 
-            url = link_tag['href']
-            
-            # 2. Python-Side Filtering (Ye important hai accuracy ke liye)
-            if title and len(title) > 2 and url:
-                # Query ke words title me match karke dekho
-                # Example: Query "Avengers" -> Title "Avengers Endgame" (Match!)
-                # Example: Query "Avengers" -> Title "Download App" (No Match!)
+            # CLEANING:
+            # 1. Title hona chahiye
+            # 2. URL valid hona chahiye
+            # 3. Title me search query ka koi bhi ek shabd hona chahiye (Loose Check)
+            if title and len(title) > 3 and "http" in url:
+                # Exclude Garbage
+                if "comment" in url or "reply" in url or "login" in url or "author" in url:
+                    continue
+                
+                # Check if ANY word from query is in title (Case Insensitive)
+                # Agar 'Avengers' search kiya aur title 'The Avengers' hai -> PASS
                 query_words = query.lower().split()
-                if any(word in title.lower() for word in query_words):
+                if any(w in title.lower() for w in query_words):
                     movies.append({"title": title, "url": url})
         
         # Deduplicate
@@ -144,23 +131,25 @@ class SmartScraper:
         qualities = []
         target_keywords = ["480p", "720p", "1080p", "2160p", "4k", "hevc", "download", "link", "watch"]
         
-        links = soup.select(SITE_CONFIG["QUALITY_BUTTON_SELECTOR"])
-        
-        # Fallback to scanning all links if buttons missing
-        if not links:
-            content_div = soup.select_one("div.entry-content")
-            links = content_div.find_all('a', href=True) if content_div else soup.find_all('a', href=True)
+        # Scan ALL links on the page
+        links = soup.find_all('a', href=True)
 
         for a in links:
-            if not a.has_attr('href'): continue
             text = a.get_text(strip=True).lower()
             href = a['href']
             
-            # Junk Filter
-            if "category" in href or "tag" in href or href == "/" or "facebook" in href: continue
+            # Extra text check (parent wrapper text)
+            parent_text = a.parent.get_text(strip=True).lower() if a.parent else ""
             
-            if any(k in text for k in target_keywords):
-                label = a.get_text(strip=True)[:50]
+            if any(k in text for k in target_keywords) or any(k in parent_text for k in target_keywords):
+                # Clean Label
+                label = a.get_text(strip=True)
+                if not label: label = "Download Link"
+                label = label[:40] # Shorten
+                
+                # Avoid garbage links
+                if "facebook" in href or "whatsapp" in href or "twitter" in href: continue
+                
                 qualities.append({"quality": label, "url": href})
 
         unique_qualities = {v['url']: v for v in qualities}.values()
@@ -169,50 +158,65 @@ class SmartScraper:
     def extract_telegram_link(self, quality_url):
         try:
             response = self.scraper.get(quality_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-            soup = BeautifulSoup(response.text, 'html.parser')
+            html_content = response.text
+            soup = BeautifulSoup(html_content, 'html.parser')
         except Exception as e:
             return {"error": str(e)}
 
-        deep_link_pattern = re.compile(r'(https?://t\.me/[a-zA-Z0-9_]+/[0-9]+)')
-        
-        all_hrefs = [a['href'] for a in soup.find_all('a', href=True)]
-        
-        # 1. Deep Link Priority
-        for link in all_hrefs:
-            if deep_link_pattern.search(link):
-                return {"tg_link": link}
-        
-        # 2. Deep Link in Text
-        text_deep = deep_link_pattern.findall(str(soup))
-        if text_deep:
-            return {"tg_link": text_deep[0]}
+        # REGEX PATTERNS
+        # 1. Strict File Link (t.me/channel/123)
+        file_pattern = re.compile(r't\.me/[a-zA-Z0-9_]+/\d+')
+        # 2. General Link (t.me/channel)
+        general_pattern = re.compile(r't\.me/[a-zA-Z0-9_]+')
 
-        # 3. Channel Link Fallback (Exclude JoinChat/Official wrappers if possible)
-        for link in all_hrefs:
-            if "t.me/" in link and "joinchat" not in link:
-                 return {"tg_link": link}
+        # SEARCH STRATEGY 1: Look in HREF attributes
+        all_a_tags = soup.find_all('a', href=True)
+        for a in all_a_tags:
+            if "t.me" in a['href']:
+                if file_pattern.search(a['href']):
+                    return {"tg_link": a['href']} # Gold Mine!
 
-        return {"error": "No valid Telegram file link found."}
+        # SEARCH STRATEGY 2: Look in Raw HTML (Scripts, OnClick, Hidden text)
+        # This fixes "Link not found" if link is hidden in JS
+        found_files = file_pattern.findall(html_content)
+        if found_files:
+            link = found_files[0]
+            if not link.startswith("http"): link = "https://" + link
+            return {"tg_link": link}
 
-scraper = SmartScraper()
+        # SEARCH STRATEGY 3: Fallback to General Link (e.g. Channel)
+        # Avoid "Join Channel" header links if possible
+        for a in all_a_tags:
+            if "t.me" in a['href'] and "join" not in a.text.lower():
+                return {"tg_link": a['href']}
+
+        # Final Fallback: Any t.me link
+        found_generals = general_pattern.findall(html_content)
+        if found_generals:
+            link = found_generals[0]
+            if not link.startswith("http"): link = "https://" + link
+            return {"tg_link": link}
+
+        return {"error": "No Telegram link found."}
+
+scraper = AggressiveScraper()
 
 # ==============================================================================
 # 3. BOT HANDLERS
 # ==============================================================================
 async def restricted(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != str(ADMIN_ID):
-        await update.message.reply_text("⛔ Access denied.")
         return False
     return True
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await restricted(update, context): return
-    await update.message.reply_text("👋 <b>Bot Ready!</b>\nSelectors Reset & Logic Improved.", parse_mode='HTML')
+    await update.message.reply_text("👋 <b>Aggressive Mode On</b>\nFilters removed. Searching deep.", parse_mode='HTML')
 
 async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await restricted(update, context): return
     query = update.message.text.strip()
-    await update.message.reply_text(f"🔍 Searching: {query}...")
+    await update.message.reply_text(f"🔍 Deep Searching: {query}...")
     
     results = scraper.search_movies(query)
     
@@ -221,15 +225,14 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
         
     if not results:
-        # Fallback message
-        await update.message.reply_text("❌ No relevant movies found.\nTry a simpler keyword.")
+        await update.message.reply_text("❌ No movies found even with aggressive search.")
         return ConversationHandler.END
 
     keyboard = []
     for idx, movie in enumerate(results):
         context.user_data[f"movie_{idx}"] = movie['url']
         keyboard.append([InlineKeyboardButton(movie['title'], callback_data=f"mov_{idx}")])
-    await update.message.reply_text(f"✅ Found {len(results)} movies:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(f"✅ Found {len(results)} raw results:", reply_markup=InlineKeyboardMarkup(keyboard))
     return SELECT_MOVIE
 
 async def movie_selection_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -237,11 +240,11 @@ async def movie_selection_handler(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     idx = int(query.data.split("_")[1])
     movie_url = context.user_data.get(f"movie_{idx}")
-    await query.edit_message_text(f"⏳ Scanning Qualities...")
+    await query.edit_message_text(f"⏳ Scanning Links...")
     qualities = scraper.get_qualities(movie_url)
 
-    if not qualities or (isinstance(qualities, dict) and "error" in qualities):
-        await query.edit_message_text("❌ No quality links found.")
+    if not qualities:
+        await query.edit_message_text("❌ No download links found.")
         return ConversationHandler.END
 
     keyboard = []
@@ -260,16 +263,15 @@ async def quality_selection_handler(update: Update, context: ContextTypes.DEFAUL
         return ConversationHandler.END
     idx = int(query.data.split("_")[1])
     qual_url = context.user_data.get(f"qual_{idx}")
-    await query.edit_message_text("🕵️‍♂️ Fetching File Link...")
+    await query.edit_message_text("🕵️‍♂️ Brute-Forcing Link...")
     result = scraper.extract_telegram_link(qual_url)
     if "error" in result:
         await query.edit_message_text(f"❌ {result['error']}")
         return ConversationHandler.END
     
-    tg_link = result["tg_link"]
     await query.edit_message_text(
         f"✅ <b>Link Found!</b>", 
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 Open Link", url=tg_link)]]),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 Open Link", url=result["tg_link"])]]),
         parse_mode="HTML"
     )
     return ConversationHandler.END
@@ -292,7 +294,6 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(conv_handler)
     
-    print(f"🚀 Starting Webhook on Port {PORT}")
     application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
@@ -303,3 +304,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+                
