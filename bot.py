@@ -15,20 +15,15 @@ from telegram.ext import (
 )
 
 # ==============================================================================
-# 🛠️ USER CONFIGURATION (STRICTER & SMARTER)
+# 🛠️ CONFIGURATION
 # ==============================================================================
 SITE_CONFIG = {
-    # Search ke liye broad selectors taaki koi movie miss na ho
     "SEARCH_ITEM_SELECTOR": "article, div.post, div.latestPost article, ul.recent-movies li, li.post-item, div.result-item",
     "SEARCH_TITLE_SELECTOR": "h2.title, h2.entry-title, p.title, .caption, a",
-    
-    # Quality Buttons ke liye specific classes jo aapki theme use karti hai
+    # Sirf specific buttons uthayenge taaki "How to download" na aaye
     "QUALITY_BUTTON_SELECTOR": "a.buttn, a.btn, a.download-link, a.button, div.linkbutton a"
 }
 
-# ==============================================================================
-# 1. CONFIGURATION
-# ==============================================================================
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -38,7 +33,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
 ALLOWED_DOMAINS = os.getenv("ALLOWED_DOMAINS", "").split(",")
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "45")) # Timeout badhaya
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "60")) # Increased for multiple page hops
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") 
 PORT = int(os.environ.get("PORT", "10000"))
 
@@ -53,36 +48,34 @@ except (ValueError, TypeError):
 SELECT_MOVIE, SELECT_QUALITY = range(2)
 
 # ==============================================================================
-# 2. SCRAPER ENGINE (AGGRESSIVE LINK EXTRACTION)
+# 2. INTELLIGENT CHAIN SCRAPER (The Magic Logic)
 # ==============================================================================
-class SmartScraper:
+class ChainScraper:
     def __init__(self):
         self.scraper = cloudscraper.create_scraper(
             browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
         )
 
-    def _safe_get(self, url):
+    def _get_soup(self, url):
         try:
-            response = self.scraper.get(url, timeout=REQUEST_TIMEOUT)
-            # Cloudflare check
-            if "Just a moment" in response.text or "Attention Required" in response.text:
-                 return {"error": "Cloudflare Blocked", "url": url}
-            return {"soup": BeautifulSoup(response.text, 'html.parser'), "url": response.url}
+            resp = self.scraper.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            if "Just a moment" in resp.text: return None, "Cloudflare Block"
+            return BeautifulSoup(resp.text, 'html.parser'), None
         except Exception as e:
-            return {"error": str(e)}
+            return None, str(e)
 
     def search_movies(self, query):
         if not ALLOWED_DOMAINS: return {"error": "Domain missing"}
         base_url = ALLOWED_DOMAINS[0].strip().rstrip('/')
         search_url = f"{base_url}/?s={query}"
         
-        result = self._safe_get(search_url)
-        if "error" in result: return result
-        soup = result["soup"]
+        soup, err = self._get_soup(search_url)
+        if err: return {"error": err}
+
         movies = []
-        
         items = soup.select(SITE_CONFIG["SEARCH_ITEM_SELECTOR"])
-        for item in items[:25]:
+        
+        for item in items[:20]:
             link_tag = item.find('a', href=True)
             if not link_tag: continue
             
@@ -91,97 +84,109 @@ class SmartScraper:
             if not title: img = item.find('img'); title = img.get('alt') if img else ""
 
             url = link_tag['href']
+            
+            # Simple Filter: Title me query ka koi bhi hissa hona chahiye
             if title and len(title) > 2 and url and "http" in url:
-                # Basic filter to ensure relevance
                 query_words = query.lower().split()
                 if any(w in title.lower() for w in query_words):
                     movies.append({"title": title, "url": url})
         
+        # Deduplicate
         seen = set()
-        unique_movies = []
+        unique = []
         for m in movies:
-            if m['url'] not in seen: unique_movies.append(m); seen.add(m['url'])
-        return unique_movies[:10]
+            if m['url'] not in seen: unique.append(m); seen.add(m['url'])
+        return unique[:10]
 
     def get_qualities(self, movie_url):
-        result = self._safe_get(movie_url)
-        if "error" in result: return result
-        soup = result["soup"]
+        soup, err = self._get_soup(movie_url)
+        if err: return []
+
         qualities = []
+        # Keywords to identify REAL quality links (ignore garbage)
+        valid_keywords = ["480p", "720p", "1080p", "2160p", "4k", "hevc", "60fps", "10bit"]
         
-        # STRICT FILTER KEYWORDS
-        target_keywords = ["480p", "720p", "1080p", "2160p", "4k", "hevc", "10bit", "hdr", "60fps"]
-        
-        # 1. Try finding styled buttons first
+        # 1. Select all potential buttons
         links = soup.select(SITE_CONFIG["QUALITY_BUTTON_SELECTOR"])
-        
-        # 2. Fallback: Search inside main content area
-        if not links:
-            content_div = soup.select_one("div.entry-content, div.post-content")
-            links = content_div.find_all('a', href=True) if content_div else []
+        if not links: links = soup.find_all('a', href=True)
 
         for a in links:
             if not a.has_attr('href'): continue
             text = a.get_text(strip=True)
-            text_lower = text.lower()
+            lower_text = text.lower()
             href = a['href']
-            
-            # Junk Filter
-            if any(x in href for x in ["category", "tag", "#", "facebook", "twitter"]): continue
 
-            # STRICT CHECK: Button text MUST contain a resolution keyword
-            if any(k in text_lower for k in target_keywords):
-                label = text[:50] # Keep label short
+            # 🛑 GARBAGE FILTER (Ye "How to download" ko hatayega)
+            if any(x in lower_text for x in ["how to", "join", "telegram", "whatsapp", "login"]): continue
+            
+            # ✅ VALIDITY CHECK
+            if any(k in lower_text for k in valid_keywords):
+                label = text[:50]
                 qualities.append({"quality": label, "url": href})
 
-        unique_qualities = {v['url']: v for v in qualities}.values()
-        return list(unique_qualities)
+        unique = {v['url']: v for v in qualities}.values()
+        return list(unique)
 
-    def extract_telegram_link(self, quality_url):
-        try:
-            # Follow redirects, important for final pages
-            response = self.scraper.get(quality_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-            html_content = response.text # Get Raw HTML
-            soup = BeautifulSoup(html_content, 'html.parser')
-        except Exception as e:
-            return {"error": f"Network Error: {str(e)}"}
+    # --- THE CHAIN RESOLVER ---
+    def resolve_chain(self, start_url):
+        """
+        Follows the path: Movie Page -> HubDrive -> HubCloud -> Verification Page
+        """
+        current_url = start_url
+        
+        # STEP 1: Check if we are on HubDrive (Look for HubCloud button)
+        if "hubdrive" in current_url or "drive" in current_url:
+            print(f"DEBUG: Landed on HubDrive: {current_url}")
+            soup, err = self._get_soup(current_url)
+            if err: return {"error": err}
+            
+            # Find "[HubCloud Server]" button
+            hubcloud_btn = soup.find('a', string=re.compile(r"HubCloud", re.I))
+            if not hubcloud_btn:
+                # Try finding any button that links to hubcloud
+                hubcloud_btn = soup.find('a', href=re.compile(r"hubcloud"))
+            
+            if hubcloud_btn:
+                current_url = hubcloud_btn['href']
+            else:
+                return {"error": "Could not find [HubCloud Server] button on HubDrive page."}
 
-        # Regex for Deep Links (t.me/channel/123) - Highest Priority
-        file_pattern = re.compile(r't\.me/[a-zA-Z0-9_]+/\d+')
+        # STEP 2: Check if we are on HubCloud (Look for Telegram button)
+        if "hubcloud" in current_url:
+            print(f"DEBUG: Landed on HubCloud: {current_url}")
+            soup, err = self._get_soup(current_url)
+            if err: return {"error": err}
+            
+            # Find "Download From Telegram" button
+            # Button class is typically 'btn-primary' or text contains 'Telegram'
+            tg_btn = soup.find('a', string=re.compile(r"Telegram", re.I))
+            if not tg_btn:
+                 tg_btn = soup.find('a', class_=re.compile(r"btn-primary|btn-success"))
+            
+            if tg_btn:
+                final_link = tg_btn['href']
+                return {"tg_link": final_link} # Ye link Verification page ka hoga
+            else:
+                return {"error": "Could not find 'Download From Telegram' button on HubCloud page."}
 
-        # STRATEGY 1: Check standard 'href' attributes
-        for a in soup.find_all('a', href=True):
-            if file_pattern.search(a['href']):
-                return {"tg_link": a['href']}
+        # Fallback: If it's a direct Telegram link
+        if "t.me" in current_url:
+            return {"tg_link": current_url}
 
-        # STRATEGY 2: BRUTE FORCE - Search in raw HTML (Scripts, hidden inputs)
-        # This finds links hidden by JavaScript
-        found_files = file_pattern.findall(html_content)
-        if found_files:
-            link = found_files[0]
-            if not link.startswith("http"): link = "https://" + link
-            return {"tg_link": link}
+        return {"error": "Could not resolve the link chain. Page structure might have changed."}
 
-        # STRATEGY 3: Fallback to any Telegram link that isn't "Join Channel"
-        for a in soup.find_all('a', href=True):
-            if "t.me/" in a['href'] and "join" not in a.get_text(strip=True).lower():
-                 return {"tg_link": a['href']}
-
-        return {"error": "No valid Telegram file link could be extracted from the final page."}
-
-scraper = SmartScraper()
+scraper = ChainScraper()
 
 # ==============================================================================
 # 3. BOT HANDLERS
 # ==============================================================================
 async def restricted(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != str(ADMIN_ID):
-        return False
+    if str(update.effective_user.id) != str(ADMIN_ID): return False
     return True
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await restricted(update, context): return
-    await update.message.reply_text("👋 <b>Bot Updated!</b>\n✅ Strict Quality Filter\n✅ Aggressive Link Extraction", parse_mode='HTML')
+    await update.message.reply_text("👋 <b>Bot Ready!</b>\nSmart Chain Resolution Active.", parse_mode='HTML')
 
 async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await restricted(update, context): return
@@ -193,7 +198,7 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Error: {results['error']}")
         return ConversationHandler.END
     if not results:
-        await update.message.reply_text("❌ No relevant movies found.")
+        await update.message.reply_text("❌ No movies found.")
         return ConversationHandler.END
 
     keyboard = []
@@ -208,11 +213,11 @@ async def movie_selection_handler(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     idx = int(query.data.split("_")[1])
     movie_url = context.user_data.get(f"movie_{idx}")
-    await query.edit_message_text(f"⏳ Filtering & Fetching Qualities...")
+    await query.edit_message_text(f"⏳ Scanning Qualities...")
     qualities = scraper.get_qualities(movie_url)
 
     if not qualities:
-        await query.edit_message_text("❌ No valid quality links (480p/720p/1080p) found.")
+        await query.edit_message_text("❌ No quality links found.")
         return ConversationHandler.END
 
     keyboard = []
@@ -232,16 +237,20 @@ async def quality_selection_handler(update: Update, context: ContextTypes.DEFAUL
     idx = int(query.data.split("_")[1])
     qual_url = context.user_data.get(f"qual_{idx}")
     
-    await query.edit_message_text("🕵️‍♂️ Brute-Forcing Final Link (This may take a moment)...")
-    result = scraper.extract_telegram_link(qual_url)
+    await query.edit_message_text("⚙️ <b>Processing Link Chain...</b>\n1. HubDrive...\n2. HubCloud...\n3. Fetching Final Link...", parse_mode="HTML")
+    
+    # Run the Chain Resolver
+    result = scraper.resolve_chain(qual_url)
     
     if "error" in result:
         await query.edit_message_text(f"❌ {result['error']}")
         return ConversationHandler.END
     
+    final_link = result["tg_link"]
+    
     await query.edit_message_text(
-        f"✅ <b>Link Successfully Extracted!</b>", 
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 Open Link", url=result["tg_link"])]]),
+        f"✅ <b>Final Link Ready!</b>\n\nClick below to open the Verification Page:", 
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 Open & Verify", url=final_link)]]),
         parse_mode="HTML"
     )
     return ConversationHandler.END
