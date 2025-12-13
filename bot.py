@@ -1,7 +1,7 @@
 import os
 import re
 import logging
-import requests
+import cloudscraper # NEW LIBRARY
 from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -15,11 +15,16 @@ from telegram.ext import (
 )
 
 # ==============================================================================
-# 🛠️ USER CONFIGURATION
+# 🛠️ USER CONFIGURATION (9xHD THEME SPECIFIC)
 # ==============================================================================
 SITE_CONFIG = {
-    "SEARCH_ITEM_SELECTOR": "ul.recent-movies li, div.latestPost article, article.post, li.post-item, div.post, figure", 
-    "SEARCH_TITLE_SELECTOR": "h2.title, h2.entry-title, p.title, .caption, a",
+    # 9xHD theme aksar <ul><li> structure ya generic <article> use karta hai
+    "SEARCH_ITEM_SELECTOR": "div.latestPost article, ul.recent-movies li, article.post, div.post, li, div.result-item", 
+    
+    # Title extraction ke liye
+    "SEARCH_TITLE_SELECTOR": "h2.title, h2.entry-title, .caption, a",
+    
+    # Download Buttons
     "QUALITY_BUTTON_SELECTOR": "a.buttn, a.btn, a.download-link, a.button"
 }
 
@@ -32,12 +37,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Environment Variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
 ALLOWED_DOMAINS = os.getenv("ALLOWED_DOMAINS", "").split(",")
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
-# NEW: Webhook URL (Render app url)
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") 
 PORT = int(os.environ.get("PORT", "10000"))
 
@@ -53,27 +56,40 @@ except (ValueError, TypeError):
 SELECT_MOVIE, SELECT_QUALITY = range(2)
 
 # ==============================================================================
-# 2. SCRAPER ENGINE (OPTIMIZED)
+# 2. CLOUDSCRAPER ENGINE (BYPASS PROTECTION)
 # ==============================================================================
-class CustomScraper:
+class CloudflareScraper:
     def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Referer": "https://google.com"
-        })
+        # Create a scraper instance that mimics a real browser (Chrome)
+        self.scraper = cloudscraper.create_scraper(
+            browser={
+                'browser': 'chrome',
+                'platform': 'windows',
+                'desktop': True
+            }
+        )
 
     def _safe_get(self, url):
         try:
-            response = self.session.get(url, timeout=REQUEST_TIMEOUT)
-            print(f"DEBUG: Visiting {url} - Status: {response.status_code}")
+            # Use scraper instead of requests
+            response = self.scraper.get(url, timeout=REQUEST_TIMEOUT)
             
-            if response.status_code in [403, 503]:
-                return {"error": "Cloudflare/Protection Blocked Request", "url": url}
+            # DEBUGGING: Print what the bot actually sees
+            print(f"DEBUG: Status Code: {response.status_code} | URL: {url}")
+            
             if response.status_code != 200:
                 return {"error": f"HTTP {response.status_code}"}
-            return {"soup": BeautifulSoup(response.text, 'html.parser'), "url": response.url}
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Print Page Title to verify if we are blocked
+            page_title = soup.title.string if soup.title else "No Title"
+            print(f"DEBUG: Page Title Seen by Bot: {page_title}")
+            
+            if "Just a moment" in page_title or "Attention Required" in page_title:
+                return {"error": "Cloudflare Blocked (Try redeploying)", "url": url}
+                
+            return {"soup": soup, "url": response.url}
         except Exception as e:
             return {"error": str(e)}
 
@@ -89,25 +105,33 @@ class CustomScraper:
 
         soup = result["soup"]
         movies = []
-        items = soup.select(SITE_CONFIG["SEARCH_ITEM_SELECTOR"])
         
+        # Try finding items
+        items = soup.select(SITE_CONFIG["SEARCH_ITEM_SELECTOR"])
+        print(f"DEBUG: Found {len(items)} items using selectors.")
+
         for item in items[:15]:
             link_tag = item.find('a', href=True)
             if not link_tag: continue
 
+            # Title Logic
             title_tag = item.select_one(SITE_CONFIG["SEARCH_TITLE_SELECTOR"])
             if title_tag:
                 title = title_tag.get_text(strip=True)
             else:
                 title = link_tag.get_text(strip=True)
+                # Fallback to Image Alt
                 if not title:
                     img = item.find('img')
                     if img: title = img.get('alt')
 
             url = link_tag['href']
-            if title and len(title) > 2 and url:
+            
+            # Basic validation to remove garbage links
+            if title and len(title) > 2 and url and "http" in url:
                 movies.append({"title": title, "url": url})
         
+        # Deduplicate
         seen = set()
         unique_movies = []
         for m in movies:
@@ -125,6 +149,7 @@ class CustomScraper:
         target_keywords = ["480p", "720p", "1080p", "2160p", "4k", "hevc", "download", "link"]
         
         links = soup.select(SITE_CONFIG["QUALITY_BUTTON_SELECTOR"])
+        # Fallback to all links if specific buttons missing
         if not links:
             content_div = soup.select_one("div.entry-content")
             links = content_div.find_all('a', href=True) if content_div else soup.find_all('a', href=True)
@@ -143,22 +168,25 @@ class CustomScraper:
 
     def extract_telegram_link(self, quality_url):
         try:
-            response = self.session.get(quality_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            # Cloudscraper handles redirects better
+            response = self.scraper.get(quality_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
             soup = BeautifulSoup(response.text, 'html.parser')
         except Exception as e:
             return {"error": str(e)}
 
         tg_pattern = re.compile(r'(https?://t\.me/[a-zA-Z0-9_]+(/[0-9]+)?)')
         found_links = []
+        
         for a in soup.find_all('a', href=True):
             if "t.me" in a['href']: found_links.append(a['href'])
+        
         text_links = tg_pattern.findall(str(soup))
         for link_tuple in text_links: found_links.append(link_tuple[0])
 
         if not found_links: return {"error": "No Telegram link found."}
         return {"tg_link": found_links[0]}
 
-scraper = CustomScraper()
+scraper = CloudflareScraper()
 
 # ==============================================================================
 # 3. BOT HANDLERS
@@ -171,26 +199,28 @@ async def restricted(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await restricted(update, context): return
-    await update.message.reply_text("👋 <b>Bot Online (Webhook Mode)!</b>", parse_mode='HTML')
+    await update.message.reply_text("👋 <b>Bot Ready (CloudScraper Mode)!</b>", parse_mode='HTML')
 
 async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await restricted(update, context): return
     query = update.message.text.strip()
     await update.message.reply_text(f"🔍 Searching: {query}...")
+    
+    # Run scraper in a separate thread to avoid blocking bot
     results = scraper.search_movies(query)
     
     if isinstance(results, dict) and "error" in results:
         await update.message.reply_text(f"⚠️ Error: {results['error']}")
         return ConversationHandler.END
     if not results:
-        await update.message.reply_text("❌ No movies found.")
+        await update.message.reply_text("❌ No movies found.\nCheck Logs for 'DEBUG: Page Title' to see if site is blocking the bot.")
         return ConversationHandler.END
 
     keyboard = []
     for idx, movie in enumerate(results):
         context.user_data[f"movie_{idx}"] = movie['url']
         keyboard.append([InlineKeyboardButton(movie['title'], callback_data=f"mov_{idx}")])
-    await update.message.reply_text(f"Found {len(results)} movies:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(f"✅ Found {len(results)} movies:", reply_markup=InlineKeyboardMarkup(keyboard))
     return SELECT_MOVIE
 
 async def movie_selection_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -198,7 +228,7 @@ async def movie_selection_handler(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     idx = int(query.data.split("_")[1])
     movie_url = context.user_data.get(f"movie_{idx}")
-    await query.edit_message_text(f"⏳ Checking Qualities...")
+    await query.edit_message_text(f"⏳ Processing...")
     qualities = scraper.get_qualities(movie_url)
 
     if not qualities or (isinstance(qualities, dict) and "error" in qualities):
@@ -221,7 +251,7 @@ async def quality_selection_handler(update: Update, context: ContextTypes.DEFAUL
         return ConversationHandler.END
     idx = int(query.data.split("_")[1])
     qual_url = context.user_data.get(f"qual_{idx}")
-    await query.edit_message_text("🕵️‍♂️ Getting Link...")
+    await query.edit_message_text("🕵️‍♂️ Decoding Link...")
     result = scraper.extract_telegram_link(qual_url)
     if "error" in result:
         await query.edit_message_text(f"❌ {result['error']}")
@@ -247,22 +277,16 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(conv_handler)
     
-    # ==========================================================================
-    # 🚀 WEBHOOK CONFIGURATION
-    # ==========================================================================
-    if not WEBHOOK_URL:
-        print("❌ CRITICAL: WEBHOOK_URL is missing in Environment Variables!")
-        return
-
-    print(f"🚀 Starting Webhook on Port {PORT} with URL {WEBHOOK_URL}")
+    print(f"🚀 Starting Webhook on Port {PORT}")
     
     application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path=BOT_TOKEN,
         webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
-        drop_pending_updates=True  # Purane atke hue updates clear karega (Avoid Conflict)
+        drop_pending_updates=True
     )
 
 if __name__ == '__main__':
     main()
+    
