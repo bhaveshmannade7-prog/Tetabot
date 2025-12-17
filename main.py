@@ -10,44 +10,39 @@ from telegram.ext import (
     filters,
 )
 import yt_dlp
+import asyncio
 
-# ---------------- CONFIG ----------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")        # Telegram Bot Token
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")    # https://your-app.onrender.com
-PORT = int(os.getenv("PORT", 10000))
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+WEBHOOK_URL = os.environ["WEBHOOK_URL"]
+PORT = int(os.environ.get("PORT", 10000))
 
-# ----------------------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-tg_app = Application.builder().token(BOT_TOKEN).build()
+telegram_app = Application.builder().token(BOT_TOKEN).build()
 
-# ---------------- COMMANDS ----------------
+# ---------- COMMANDS ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Hi!\n\n"
-        "👉 YouTube video link bhejo\n"
-        "🎵 /audio  – sirf audio ke liye\n\n"
-        "⚠️ Personal / own content only"
+        "👋 YouTube Downloader Bot\n\n"
+        "🔗 Link bhejo\n"
+        "🎵 /audio = audio only\n\n"
+        "⚠️ Personal use only"
     )
 
 async def audio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["mode"] = "audio"
-    await update.message.reply_text("🎵 Audio mode ON\nAb YouTube link bhejo")
+    await update.message.reply_text("🎵 Audio mode ON")
 
-# ---------------- VIDEO HANDLER ----------------
+# ---------- HANDLER ----------
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
     chat_id = update.message.chat_id
     mode = context.user_data.get("mode", "video")
 
-    await update.message.reply_text("⏳ Download ho raha hai...")
+    await update.message.reply_text("⏳ Downloading...")
 
-    ydl_opts = {
-        "outtmpl": "download.%(ext)s",
-        "quiet": True,
-    }
+    ydl_opts = {"outtmpl": "file.%(ext)s", "quiet": True}
 
     if mode == "audio":
         ydl_opts["format"] = "bestaudio"
@@ -60,46 +55,43 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            file_name = ydl.prepare_filename(info)
+            filename = ydl.prepare_filename(info)
             if mode == "audio":
-                file_name = file_name.rsplit(".", 1)[0] + ".mp3"
+                filename = filename.rsplit(".", 1)[0] + ".mp3"
 
-        with open(file_name, "rb") as f:
+        with open(filename, "rb") as f:
             if mode == "audio":
-                await context.bot.send_audio(chat_id, audio=f)
+                await context.bot.send_audio(chat_id, f)
             else:
-                await context.bot.send_video(chat_id, video=f)
+                await context.bot.send_video(chat_id, f)
 
-        os.remove(file_name)
+        os.remove(filename)
         context.user_data["mode"] = "video"
 
     except Exception as e:
-        logger.error(e)
-        await update.message.reply_text("❌ Error aaya, dusra link try karo")
+        logging.exception(e)
+        await update.message.reply_text("❌ Download failed")
 
-# ---------------- WEBHOOK ----------------
+# ---------- WEBHOOK ----------
 @app.route("/", methods=["POST"])
 def webhook():
-    update = Update.de_json(request.get_json(force=True), tg_app.bot)
-    tg_app.update_queue.put_nowait(update)
+    update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+    asyncio.create_task(telegram_app.process_update(update))
     return "ok"
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Bot is running"
+    return "Bot running"
 
-# ---------------- MAIN ----------------
-async def setup():
-    await tg_app.initialize()
-    await tg_app.bot.set_webhook(f"{WEBHOOK_URL}/")
+async def main():
+    await telegram_app.initialize()
+    await telegram_app.bot.set_webhook(f"{WEBHOOK_URL}/")
+    await telegram_app.start()
 
-    tg_app.add_handler(CommandHandler("start", start))
-    tg_app.add_handler(CommandHandler("audio", audio_cmd))
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-
-    await tg_app.start()
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CommandHandler("audio", audio_cmd))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(setup())
+    asyncio.run(main())
     app.run(host="0.0.0.0", port=PORT)
