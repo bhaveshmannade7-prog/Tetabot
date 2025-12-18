@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 import shutil
-import traceback
+import requests # New Import
 from datetime import datetime, date
 from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -27,10 +27,9 @@ COOKIES_ENV = os.getenv("COOKIES_CONTENT")
 DOWNLOAD_DIR = "downloads"
 DATA_FILE = "data.json"
 COOKIE_FILE = "cookies.txt"
-DAILY_LIMIT = 10 
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB Limit
+DAILY_LIMIT = 20
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
-# Crash Proofing
 PROCESSING_QUEUE = set()
 
 # Logging
@@ -40,34 +39,39 @@ logger = logging.getLogger(__name__)
 # --- COOKIE SETUP ---
 if COOKIES_ENV and not os.path.exists(COOKIE_FILE):
     try:
-        with open(COOKIE_FILE, 'w') as f: 
-            f.write(COOKIES_ENV)
-    except: 
-        pass
+        with open(COOKIE_FILE, 'w') as f: f.write(COOKIES_ENV)
+    except: pass
 
-# --- DATA PERSISTENCE (FIXED SYNTAX) ---
+# --- HELPER: URL RESOLVER (Fix for Teraboxurl.com) ---
+def resolve_url(url):
+    try:
+        # Sirf Terabox links ko resolve karo
+        if "terabox" in url or "terashare" in url:
+            logger.info(f"Resolving URL: {url}")
+            response = requests.head(url, allow_redirects=True, timeout=10)
+            resolved_url = response.url
+            logger.info(f"Resolved to: {resolved_url}")
+            return resolved_url
+        return url
+    except Exception as e:
+        logger.error(f"URL Resolve Error: {e}")
+        return url
+
+# --- DATA HANDLING ---
 def load_data():
-    if not os.path.exists(DATA_FILE): 
-        return {}
-    try: 
-        with open(DATA_FILE, 'r') as f: 
-            return json.load(f)
-    except: 
-        return {}
+    if not os.path.exists(DATA_FILE): return {}
+    try: with open(DATA_FILE, 'r') as f: return json.load(f)
+    except: return {}
 
 def save_data(data):
-    try: 
-        with open(DATA_FILE, 'w') as f: 
-            json.dump(data, f, indent=4)
-    except: 
-        pass
+    try: with open(DATA_FILE, 'w') as f: json.dump(data, f, indent=4)
+    except: pass
 
 def get_user_data(user_id):
     data = load_data()
     str_id = str(user_id)
     today = str(date.today())
-    if str_id not in data: 
-        data[str_id] = {"premium": False, "date": today, "count": 0}
+    if str_id not in data: data[str_id] = {"premium": False, "date": today, "count": 0}
     if data[str_id]["date"] != today:
         data[str_id]["date"] = today
         data[str_id]["count"] = 0
@@ -97,7 +101,9 @@ def download_media(url, mode='best'):
     if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
     timestamp = int(time.time())
     
-    # Universal Options
+    # 1. URL Resolve (Important Fix)
+    final_url = resolve_url(url)
+
     ydl_opts = {
         'outtmpl': f'{DOWNLOAD_DIR}/%(id)s_{timestamp}.%(ext)s',
         'quiet': True,
@@ -106,12 +112,10 @@ def download_media(url, mode='best'):
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
     }
 
-    # --- COOKIE LOGIC ---
-    # Diskwala ke liye cookies mat lagao (Direct Parsing)
-    if "diskwala" not in url and os.path.exists(COOKIE_FILE):
+    if "diskwala" not in final_url and os.path.exists(COOKIE_FILE):
         ydl_opts['cookiefile'] = COOKIE_FILE
 
-    # --- Mode Logic ---
+    # Modes
     if mode == 'audio':
         ydl_opts.update({'format': 'bestaudio/best', 'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}]})
     elif mode == '360':
@@ -123,7 +127,7 @@ def download_media(url, mode='best'):
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            info = ydl.extract_info(final_url, download=True)
             filename = ydl.prepare_filename(info)
             base, ext = os.path.splitext(filename)
             final_filename = base + ".mp3" if mode == 'audio' else base + ".mp4"
@@ -139,7 +143,7 @@ def download_media(url, mode='best'):
 
 # --- HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 **Bot Ready!**\nSend YouTube, TeraBox, or Diskwala links.", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("👋 **Bot Ready!**\nLinks: YouTube, TeraBox, Diskwala.", parse_mode=ParseMode.MARKDOWN)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -160,14 +164,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("🚫 Daily Limit Reached.")
             return
 
-        # YouTube Detection
         if "youtube.com" in url or "youtu.be" in url:
             context.user_data['current_url'] = url
             keyboard = [[InlineKeyboardButton("🎵 MP3", callback_data="audio"), InlineKeyboardButton("🎬 360p", callback_data="360")],
                         [InlineKeyboardButton("🎬 720p", callback_data="720"), InlineKeyboardButton("💎 Best", callback_data="best")]]
             await update.message.reply_text("⚙️ **Quality:**", reply_markup=InlineKeyboardMarkup(keyboard))
         else:
-            wait_msg = await update.message.reply_text("⏳ **Processing Link...**", parse_mode=ParseMode.MARKDOWN)
+            wait_msg = await update.message.reply_text("⏳ **Processing...** (Resolving Link)", parse_mode=ParseMode.MARKDOWN)
             await process_download(update, context, url, 'best', wait_msg, user_id)
 
     except Exception as e:
@@ -200,13 +203,13 @@ async def process_download(update, context, url, quality, wait_msg, user_id):
             await wait_msg.edit_text("📤 **Uploading...**")
             with open(file_path, 'rb') as f:
                 if quality == 'audio':
-                    await context.bot.send_audio(chat_id=user_id, audio=f, title=title, caption="Downloaded by Bot")
+                    await context.bot.send_audio(chat_id=user_id, audio=f, title=title)
                 else:
                     await context.bot.send_video(chat_id=user_id, video=f, caption=title, supports_streaming=True, width=width, height=height, duration=duration, read_timeout=120, write_timeout=120)
             increment_download(user_id)
             await wait_msg.delete()
         else:
-            await wait_msg.edit_text("❌ Download Failed.\nCheck Link or Cookies.")
+            await wait_msg.edit_text("❌ Download Failed.\nCheck **Cookies** (TeraBox) or Link.")
     except Exception as e:
         logger.error(f"Process Error: {e}")
         try: await wait_msg.edit_text("❌ Processing Error.")
@@ -247,3 +250,4 @@ else:
         asyncio.set_event_loop(loop)
         loop.run_until_complete(setup_bot())
     except: pass
+    
