@@ -20,18 +20,31 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  
 REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "") 
+COOKIES_ENV = os.getenv("COOKIES_CONTENT") # New: Load cookies from Env
 
 # Constants
 DOWNLOAD_DIR = "downloads"
 DATA_FILE = "data.json"
+COOKIE_FILE = "cookies.txt"
 DAILY_LIMIT = 3
-MAX_FILE_SIZE = 50 * 1024 * 1024  
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB Limit
 
 # Logging Setup
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# --- COOKIE SETUP (AUTO-GENERATOR) ---
+# Agar Env Var me cookies hai, toh file bana do. 
+# Yeh Render pe bina file upload kiye cookies use karne ke liye hai.
+if COOKIES_ENV and not os.path.exists(COOKIE_FILE):
+    try:
+        with open(COOKIE_FILE, 'w') as f:
+            f.write(COOKIES_ENV)
+        logger.info("✅ Cookies.txt created from Environment Variable.")
+    except Exception as e:
+        logger.error(f"❌ Failed to create cookies.txt: {e}")
 
 # --- DATA PERSISTENCE ---
 def load_data():
@@ -97,11 +110,21 @@ def download_video(url, is_audio_only=False):
 
     timestamp = int(time.time())
     
+    # Check if cookies exist
+    has_cookies = os.path.exists(COOKIE_FILE)
+    if not has_cookies:
+        logger.warning("⚠️ No cookies.txt found. Downloads might fail on Render!")
+
     ydl_opts = {
         'outtmpl': f'{DOWNLOAD_DIR}/%(id)s_{timestamp}.%(ext)s',
         'quiet': True,
         'no_warnings': True,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
     }
+
+    # Add Cookie file if it exists
+    if has_cookies:
+        ydl_opts['cookiefile'] = COOKIE_FILE
 
     if is_audio_only:
         ydl_opts.update({
@@ -113,6 +136,7 @@ def download_video(url, is_audio_only=False):
             }],
         })
     else:
+        # Optimized for Shorts & Regular videos under 50MB
         ydl_opts.update({
             'format': 'best[filesize<50M]/best', 
         })
@@ -135,7 +159,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     msg = (
         "👋 **Welcome to YT Downloader Bot!**\n\n"
-        "Send me a YouTube link to download.\n"
+        "Send me a YouTube link (Video or Shorts).\n"
         f"Current Mode: **{user['mode'].upper()}**\n\n"
         "**Commands:**\n"
         "/audio - Switch to MP3 Audio mode\n"
@@ -159,6 +183,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     url = update.message.text.strip()
     
+    # Basic Validation
+    if "http" not in url:
+        return # Ignore normal chat messages
+        
     if "youtube.com" not in url and "youtu.be" not in url:
         await update.message.reply_text("❌ Please send a valid YouTube link.")
         return
@@ -196,12 +224,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await wait_msg.delete()
         except Exception as e:
             logger.error(f"Send error: {e}")
-            await wait_msg.edit_text("❌ Error uploading file.")
+            await wait_msg.edit_text("❌ Error uploading file to Telegram.")
         finally:
             if os.path.exists(file_path):
                 os.remove(file_path)
     else:
-        await wait_msg.edit_text("❌ Download failed.")
+        await wait_msg.edit_text("❌ **Download Failed.**\nServer IP blocked by YouTube. Try again later or ask Admin to update Cookies.")
 
 # --- ADMIN COMMANDS ---
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -239,7 +267,7 @@ ptb_application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, hand
 # --- WEBHOOK & STARTUP ---
 async def setup_bot():
     """Initializes the bot and sets the webhook."""
-    # 1. Initialize the App (CRITICAL FIX)
+    # 1. Initialize the App
     await ptb_application.initialize()
     
     # 2. Set Webhook
@@ -253,10 +281,7 @@ async def setup_bot():
 @app.route('/webhook', methods=['POST'])
 def webhook_handler():
     if request.method == "POST":
-        # Process the update
         update = Update.de_json(request.get_json(force=True), ptb_application.bot)
-        
-        # NOTE: We do not re-initialize here. It is done in setup_bot()
         asyncio.run(ptb_application.process_update(update))
         return "OK"
     return "Invalid Request"
@@ -273,7 +298,6 @@ if __name__ == "__main__":
     app.run(port=5000)
 else:
     # Production (Gunicorn)
-    # This block runs once when Gunicorn starts the worker
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
