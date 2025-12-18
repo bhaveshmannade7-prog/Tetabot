@@ -1,6 +1,6 @@
 Flask==2.3.3
 python-telegram-bot==20.6
-yt-dlp==2023.10.13
+yt-dlp>=2024.10.0
 gunicorn==21.2.0
 python-dotenv==1.0.0
 nest-asyncio==1.5.8
