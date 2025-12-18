@@ -5,7 +5,7 @@ import json
 import time
 import shutil
 import requests
-import re # New import for extracting codes
+import re  # Regex zaroori hai code extract karne ke liye
 from datetime import datetime, date
 from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -45,34 +45,38 @@ if COOKIES_ENV and not os.path.exists(COOKIE_FILE):
     except:
         pass
 
-# --- HELPER: ADVANCED URL RESOLVER ---
+# --- HELPER: MASTER URL RESOLVER (FIXED) ---
 def resolve_url(url):
     try:
-        # 1. Agar ye TeraBox short link hai, toh resolve karo
+        logger.info(f"Incoming URL: {url}")
+        
+        # 1. Pehle Link Resolve karo (Short links ke liye)
         if "terabox" in url or "terashare" in url or "1024tera" in url:
             headers = {'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36'}
             try:
-                response = requests.get(url, allow_redirects=True, timeout=10, stream=True, headers=headers)
+                # Sirf HEAD request se check karte hain taaki fast ho
+                response = requests.head(url, allow_redirects=True, timeout=10, headers=headers)
                 resolved_url = response.url
             except:
-                resolved_url = url
-
+                # Fallback to GET if HEAD fails
+                try:
+                    response = requests.get(url, allow_redirects=True, timeout=10, stream=True, headers=headers)
+                    resolved_url = response.url
+                except:
+                    resolved_url = url
+            
             logger.info(f"Resolved to: {resolved_url}")
 
-            # 2. 'surl' pattern check (Jaise aapke error mein aaya)
-            # URL: .../sharing/link?surl=cRGqqsrlEOkf56OCXBn2gw
-            if "surl=" in resolved_url:
-                # Code extract karo
-                match = re.search(r'surl=([a-zA-Z0-9_-]+)', resolved_url)
-                if match:
-                    code = match.group(1)
-                    # TeraBox rule: Agar code '1' se shuru nahi hota, toh '1' lagao
-                    final_code = "1" + code
-                    fixed_url = f"https://www.terabox.com/s/{final_code}"
-                    logger.info(f"Fixed URL constructed: {fixed_url}")
-                    return fixed_url
+            # 2. 'surl' Parameter Fix (Ye hai main MAGIC FIX)
+            # Pattern: surl=cRGqqsrlEOkf56OCXBn2gw -> /s/1cRGqqsrlEOkf56OCXBn2gw
+            match = re.search(r'surl=([a-zA-Z0-9_-]+)', resolved_url)
+            if match:
+                code = match.group(1)
+                final_url = f"https://www.terabox.com/s/1{code}"
+                logger.info(f"Converted 'surl' link to: {final_url}")
+                return final_url
 
-            # 3. Agar '1024tera' ya '.app' hai, toh standard domain lagao
+            # 3. Domain Fix (1024tera -> terabox)
             if "1024tera.com" in resolved_url or "terabox.app" in resolved_url:
                 return resolved_url.replace("1024tera.com", "terabox.com").replace("terabox.app", "terabox.com")
 
@@ -129,7 +133,7 @@ def download_media(url, mode='best'):
     if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
     timestamp = int(time.time())
     
-    # Clean URL using new logic
+    # URL Cleaning
     final_url = resolve_url(url)
 
     ydl_opts = {
@@ -196,7 +200,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         [InlineKeyboardButton("🎬 720p", callback_data="720"), InlineKeyboardButton("💎 Best", callback_data="best")]]
             await update.message.reply_text("⚙️ **Quality:**", reply_markup=InlineKeyboardMarkup(keyboard))
         else:
-            wait_msg = await update.message.reply_text("⏳ **Processing...**", parse_mode=ParseMode.MARKDOWN)
+            wait_msg = await update.message.reply_text("⏳ **Processing Link...**", parse_mode=ParseMode.MARKDOWN)
             await process_download(update, context, url, 'best', wait_msg, user_id)
 
     except Exception as e:
@@ -278,3 +282,4 @@ else:
         asyncio.set_event_loop(loop)
         loop.run_until_complete(setup_bot())
     except: pass
+        
