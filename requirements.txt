@@ -4,3 +4,4 @@ yt-dlp>=2024.10.0
 gunicorn==21.2.0
 python-dotenv==1.0.0
 nest-asyncio==1.5.8
+requests==2.31.0
