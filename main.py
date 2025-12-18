@@ -40,24 +40,34 @@ logger = logging.getLogger(__name__)
 # --- COOKIE SETUP ---
 if COOKIES_ENV and not os.path.exists(COOKIE_FILE):
     try:
-        with open(COOKIE_FILE, 'w') as f: f.write(COOKIES_ENV)
-    except: pass
+        with open(COOKIE_FILE, 'w') as f: 
+            f.write(COOKIES_ENV)
+    except: 
+        pass
 
-# --- DATA PERSISTENCE ---
+# --- DATA PERSISTENCE (FIXED SYNTAX) ---
 def load_data():
-    if not os.path.exists(DATA_FILE): return {}
-    try: with open(DATA_FILE, 'r') as f: return json.load(f)
-    except: return {}
+    if not os.path.exists(DATA_FILE): 
+        return {}
+    try: 
+        with open(DATA_FILE, 'r') as f: 
+            return json.load(f)
+    except: 
+        return {}
 
 def save_data(data):
-    try: with open(DATA_FILE, 'w') as f: json.dump(data, f, indent=4)
-    except: pass
+    try: 
+        with open(DATA_FILE, 'w') as f: 
+            json.dump(data, f, indent=4)
+    except: 
+        pass
 
 def get_user_data(user_id):
     data = load_data()
     str_id = str(user_id)
     today = str(date.today())
-    if str_id not in data: data[str_id] = {"premium": False, "date": today, "count": 0}
+    if str_id not in data: 
+        data[str_id] = {"premium": False, "date": today, "count": 0}
     if data[str_id]["date"] != today:
         data[str_id]["date"] = today
         data[str_id]["count"] = 0
@@ -96,7 +106,7 @@ def download_media(url, mode='best'):
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
     }
 
-    # --- COOKIE LOGIC (UPDATED) ---
+    # --- COOKIE LOGIC ---
     # Diskwala ke liye cookies mat lagao (Direct Parsing)
     if "diskwala" not in url and os.path.exists(COOKIE_FILE):
         ydl_opts['cookiefile'] = COOKIE_FILE
