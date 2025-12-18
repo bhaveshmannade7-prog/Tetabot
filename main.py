@@ -5,7 +5,7 @@ import json
 import time
 import shutil
 import requests
-import re  # Regex zaroori hai code extract karne ke liye
+import re
 from datetime import datetime, date
 from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -28,7 +28,7 @@ COOKIES_ENV = os.getenv("COOKIES_CONTENT")
 DOWNLOAD_DIR = "downloads"
 DATA_FILE = "data.json"
 COOKIE_FILE = "cookies.txt"
-DAILY_LIMIT = 20
+DAILY_LIMIT = 50
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB Limit
 
 PROCESSING_QUEUE = set()
@@ -45,46 +45,43 @@ if COOKIES_ENV and not os.path.exists(COOKIE_FILE):
     except:
         pass
 
-# --- HELPER: MASTER URL RESOLVER (FIXED) ---
+# --- HELPER: ULTIMATE URL RESOLVER ---
 def resolve_url(url):
     try:
-        logger.info(f"Incoming URL: {url}")
+        logger.info(f"Original URL: {url}")
         
-        # 1. Pehle Link Resolve karo (Short links ke liye)
+        # 1. TeraBox 'surl' Fix (Direct String Manipulation - Fastest & Safest)
         if "terabox" in url or "terashare" in url or "1024tera" in url:
-            headers = {'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36'}
-            try:
-                # Sirf HEAD request se check karte hain taaki fast ho
-                response = requests.head(url, allow_redirects=True, timeout=10, headers=headers)
-                resolved_url = response.url
-            except:
-                # Fallback to GET if HEAD fails
-                try:
-                    response = requests.get(url, allow_redirects=True, timeout=10, stream=True, headers=headers)
-                    resolved_url = response.url
-                except:
-                    resolved_url = url
+            # Agar 'surl=' dikh jaye, toh network call mat karo, seedha fix karo
+            if "surl=" in url:
+                match = re.search(r'surl=([a-zA-Z0-9_-]+)', url)
+                if match:
+                    code = match.group(1)
+                    final_url = f"https://www.terabox.com/s/1{code}"
+                    logger.info(f"Fixed 'surl' Link -> {final_url}")
+                    return final_url
             
-            logger.info(f"Resolved to: {resolved_url}")
+            # Agar link shortener hai (teraboxurl), toh resolve karo
+            if "teraboxurl" in url:
+                try:
+                    resp = requests.head(url, allow_redirects=True, timeout=5)
+                    resolved = resp.url
+                    # Resolve hone ke baad wapas surl check karo
+                    if "surl=" in resolved:
+                        match = re.search(r'surl=([a-zA-Z0-9_-]+)', resolved)
+                        if match:
+                            return f"https://www.terabox.com/s/1{match.group(1)}"
+                    return resolved
+                except:
+                    pass
 
-            # 2. 'surl' Parameter Fix (Ye hai main MAGIC FIX)
-            # Pattern: surl=cRGqqsrlEOkf56OCXBn2gw -> /s/1cRGqqsrlEOkf56OCXBn2gw
-            match = re.search(r'surl=([a-zA-Z0-9_-]+)', resolved_url)
-            if match:
-                code = match.group(1)
-                final_url = f"https://www.terabox.com/s/1{code}"
-                logger.info(f"Converted 'surl' link to: {final_url}")
-                return final_url
-
-            # 3. Domain Fix (1024tera -> terabox)
-            if "1024tera.com" in resolved_url or "terabox.app" in resolved_url:
-                return resolved_url.replace("1024tera.com", "terabox.com").replace("terabox.app", "terabox.com")
-
-            return resolved_url
-
+        # 2. Domain Corrections
+        if "terabox.app" in url:
+            return url.replace("terabox.app", "terabox.com")
+            
         return url
     except Exception as e:
-        logger.error(f"URL Resolve Error: {e}")
+        logger.error(f"URL Fix Error: {e}")
         return url
 
 # --- DATA PERSISTENCE ---
@@ -133,47 +130,62 @@ def download_media(url, mode='best'):
     if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
     timestamp = int(time.time())
     
-    # URL Cleaning
+    # 1. Fix URL Format
     final_url = resolve_url(url)
+    logger.info(f"Passing to yt-dlp: {final_url}")
 
+    # 2. Configure Options
     ydl_opts = {
         'outtmpl': f'{DOWNLOAD_DIR}/%(id)s_{timestamp}.%(ext)s',
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
-        'user_agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36',
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+        # Diskwala/Generic ke liye zaroori settings:
+        'allow_unplayable_formats': True,
+        'ignoreerrors': True,
     }
 
+    # Cookies check
     if "diskwala" not in final_url and os.path.exists(COOKIE_FILE):
         ydl_opts['cookiefile'] = COOKIE_FILE
 
+    # Mode Selection
     if mode == 'audio':
         ydl_opts.update({'format': 'bestaudio/best', 'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}]})
-    elif mode == '360':
-        ydl_opts.update({'format': 'bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best[height<=360]', 'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]})
-    elif mode == '720':
-        ydl_opts.update({'format': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]', 'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]})
-    else: 
-        ydl_opts.update({'format': 'best[ext=mp4][filesize<50M]/best[filesize<50M]/best', 'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]})
+    else:
+        # Generic fallback ke liye 'best' format safe rehta hai
+        ydl_opts.update({
+            'format': 'best[ext=mp4][filesize<50M]/best[filesize<50M]/best',
+            # Video Convertor hata diya hai generic sites ke liye taaki error na aaye
+        })
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(final_url, download=True)
-            filename = ydl.prepare_filename(info)
-            base, ext = os.path.splitext(filename)
-            final_filename = base + ".mp3" if mode == 'audio' else base + ".mp4"
             
-            if not os.path.exists(final_filename) and os.path.exists(filename):
-                final_filename = filename
+            # Agar info None hai (Download fail)
+            if not info:
+                return None, None, None, None, None, "Extraction Failed"
 
-            return final_filename, info.get('title', 'Media'), info.get('duration'), info.get('width'), info.get('height'), None
+            filename = ydl.prepare_filename(info)
+            
+            # Extension Check
+            base, ext = os.path.splitext(filename)
+            final_filename = base + ".mp3" if mode == 'audio' else filename
+            
+            if mode == 'audio' and os.path.exists(filename) and not os.path.exists(final_filename):
+                # Kabhi kabhi yt-dlp rename nahi karta, hum manually check kar rahe hain
+                pass 
+
+            return filename, info.get('title', 'Media'), info.get('duration'), info.get('width'), info.get('height'), None
 
     except Exception as e:
         return None, None, None, None, None, str(e)
 
 # --- HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 **Bot Ready!**\nLinks: YouTube, TeraBox, Diskwala.", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("👋 **Bot Ready!**\nSupports: YouTube, TeraBox, Diskwala.", parse_mode=ParseMode.MARKDOWN)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -200,7 +212,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         [InlineKeyboardButton("🎬 720p", callback_data="720"), InlineKeyboardButton("💎 Best", callback_data="best")]]
             await update.message.reply_text("⚙️ **Quality:**", reply_markup=InlineKeyboardMarkup(keyboard))
         else:
-            wait_msg = await update.message.reply_text("⏳ **Processing Link...**", parse_mode=ParseMode.MARKDOWN)
+            # TeraBox / Diskwala
+            wait_msg = await update.message.reply_text("⏳ **Processing...**", parse_mode=ParseMode.MARKDOWN)
             await process_download(update, context, url, 'best', wait_msg, user_id)
 
     except Exception as e:
@@ -239,12 +252,18 @@ async def process_download(update, context, url, quality, wait_msg, user_id):
             increment_download(user_id)
             await wait_msg.delete()
         else:
-            clean_error = str(error_msg).replace(os.getcwd(), "")[:200]
-            await wait_msg.edit_text(f"❌ **Failed.**\n`{clean_error}`", parse_mode=ParseMode.MARKDOWN)
+            # Error Formatting
+            clean_error = str(error_msg).replace(os.getcwd(), "")[:300]
+            if "Unsupported URL" in clean_error and "terabox" in url:
+                clean_error = "TeraBox Link Format Issue. (Still working on fix)"
+            elif "Unsupported URL" in clean_error and "diskwala" in url:
+                clean_error = "Diskwala is not supported directly (Landing Page detected)."
+            
+            await wait_msg.edit_text(f"❌ **Failed.**\n\nError: `{clean_error}`", parse_mode=ParseMode.MARKDOWN)
             
     except Exception as e:
         logger.error(f"Process Error: {e}")
-        try: await wait_msg.edit_text("❌ Processing Error.")
+        try: await wait_msg.edit_text("❌ Bot Processing Error.")
         except: pass
     finally:
         if file_path and os.path.exists(file_path): 
@@ -282,4 +301,3 @@ else:
         asyncio.set_event_loop(loop)
         loop.run_until_complete(setup_bot())
     except: pass
-        
