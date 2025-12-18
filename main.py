@@ -5,7 +5,7 @@ import json
 import time
 import shutil
 import requests
-import traceback # Error trace ke liye
+import traceback
 from datetime import datetime, date
 from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -45,18 +45,34 @@ if COOKIES_ENV and not os.path.exists(COOKIE_FILE):
     except:
         pass
 
-# --- HELPER: URL RESOLVER ---
+# --- HELPER: SMART URL RESOLVER (FIXED) ---
 def resolve_url(url):
     try:
-        if "terabox" in url or "terashare" in url:
-            logger.info(f"Resolving URL: {url}")
-            # User Agent badal kar try karte hain
+        # 1. Manual Domain Swap (Ye "Unsupported URL" fix karega)
+        if "terabox.app" in url:
+            url = url.replace("terabox.app", "1024tera.com")
+            logger.info(f"Domain Swapped: {url}")
+        elif "teraboxurl" in url:
+            # Shortener handling
+            pass 
+
+        # 2. Deep Resolve (Follow Redirects)
+        if "terabox" in url or "terashare" in url or "1024tera" in url:
             headers = {'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36'}
-            response = requests.head(url, allow_redirects=True, timeout=15, headers=headers)
-            return response.url
+            # 'HEAD' ki jagah 'GET' use kar rahe hain jo zyada reliable hai
+            response = requests.get(url, allow_redirects=True, timeout=10, stream=True, headers=headers)
+            final_url = response.url
+            
+            # Agar resolve hone ke baad bhi .app hai, toh wapas badal do
+            if "terabox.app" in final_url:
+                final_url = final_url.replace("terabox.app", "1024tera.com")
+            
+            return final_url
+            
         return url
     except Exception as e:
         logger.error(f"URL Resolve Error: {e}")
+        # Agar resolve fail ho, toh edited URL hi return karo
         return url
 
 # --- DATA PERSISTENCE ---
@@ -105,6 +121,7 @@ def download_media(url, mode='best'):
     if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
     timestamp = int(time.time())
     
+    # Resolve Link
     final_url = resolve_url(url)
 
     ydl_opts = {
@@ -112,7 +129,6 @@ def download_media(url, mode='best'):
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
-        # Updated User Agent to act like a Mobile
         'user_agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36',
     }
 
@@ -141,7 +157,6 @@ def download_media(url, mode='best'):
             return final_filename, info.get('title', 'Media'), info.get('duration'), info.get('width'), info.get('height'), None
 
     except Exception as e:
-        # Return the EXACT error message
         return None, None, None, None, None, str(e)
 
 # --- HANDLERS ---
@@ -194,7 +209,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def process_download(update, context, url, quality, wait_msg, user_id):
     file_path = None
     try:
-        # Get ERROR message if fails
         file_path, title, duration, width, height, error_msg = download_media(url, quality)
         
         if file_path and os.path.exists(file_path):
@@ -213,13 +227,13 @@ async def process_download(update, context, url, quality, wait_msg, user_id):
             increment_download(user_id)
             await wait_msg.delete()
         else:
-            # Send REAL Error to User
-            clean_error = str(error_msg).replace(os.getcwd(), "")[:200] # Hide path, limit length
-            await wait_msg.edit_text(f"❌ **Download Failed.**\n\n**Reason:** `{clean_error}`\n\n_Tip: Refresh Cookies & try again._", parse_mode=ParseMode.MARKDOWN)
+            # Clean Error Message
+            clean_error = str(error_msg).replace(os.getcwd(), "")[:200]
+            await wait_msg.edit_text(f"❌ **Failed.**\n\n`{clean_error}`", parse_mode=ParseMode.MARKDOWN)
             
     except Exception as e:
         logger.error(f"Process Error: {e}")
-        try: await wait_msg.edit_text(f"❌ Bot Logic Error: {str(e)}")
+        try: await wait_msg.edit_text("❌ Processing Error.")
         except: pass
     finally:
         if file_path and os.path.exists(file_path): 
