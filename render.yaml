@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: telegram-yt-downloader
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app --timeout 60 --workers 1 --threads 8
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.12
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: REQUIRED_CHANNEL
+        sync: false # e.g., @MyChannelUsername (Leave empty to disable)
