@@ -5,7 +5,7 @@ import json
 import time
 import shutil
 import requests
-import traceback
+import re # New import for extracting codes
 from datetime import datetime, date
 from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -45,34 +45,42 @@ if COOKIES_ENV and not os.path.exists(COOKIE_FILE):
     except:
         pass
 
-# --- HELPER: SMART URL RESOLVER (FIXED) ---
+# --- HELPER: ADVANCED URL RESOLVER ---
 def resolve_url(url):
     try:
-        # 1. Manual Domain Swap (Ye "Unsupported URL" fix karega)
-        if "terabox.app" in url:
-            url = url.replace("terabox.app", "1024tera.com")
-            logger.info(f"Domain Swapped: {url}")
-        elif "teraboxurl" in url:
-            # Shortener handling
-            pass 
-
-        # 2. Deep Resolve (Follow Redirects)
+        # 1. Agar ye TeraBox short link hai, toh resolve karo
         if "terabox" in url or "terashare" in url or "1024tera" in url:
             headers = {'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36'}
-            # 'HEAD' ki jagah 'GET' use kar rahe hain jo zyada reliable hai
-            response = requests.get(url, allow_redirects=True, timeout=10, stream=True, headers=headers)
-            final_url = response.url
-            
-            # Agar resolve hone ke baad bhi .app hai, toh wapas badal do
-            if "terabox.app" in final_url:
-                final_url = final_url.replace("terabox.app", "1024tera.com")
-            
-            return final_url
-            
+            try:
+                response = requests.get(url, allow_redirects=True, timeout=10, stream=True, headers=headers)
+                resolved_url = response.url
+            except:
+                resolved_url = url
+
+            logger.info(f"Resolved to: {resolved_url}")
+
+            # 2. 'surl' pattern check (Jaise aapke error mein aaya)
+            # URL: .../sharing/link?surl=cRGqqsrlEOkf56OCXBn2gw
+            if "surl=" in resolved_url:
+                # Code extract karo
+                match = re.search(r'surl=([a-zA-Z0-9_-]+)', resolved_url)
+                if match:
+                    code = match.group(1)
+                    # TeraBox rule: Agar code '1' se shuru nahi hota, toh '1' lagao
+                    final_code = "1" + code
+                    fixed_url = f"https://www.terabox.com/s/{final_code}"
+                    logger.info(f"Fixed URL constructed: {fixed_url}")
+                    return fixed_url
+
+            # 3. Agar '1024tera' ya '.app' hai, toh standard domain lagao
+            if "1024tera.com" in resolved_url or "terabox.app" in resolved_url:
+                return resolved_url.replace("1024tera.com", "terabox.com").replace("terabox.app", "terabox.com")
+
+            return resolved_url
+
         return url
     except Exception as e:
         logger.error(f"URL Resolve Error: {e}")
-        # Agar resolve fail ho, toh edited URL hi return karo
         return url
 
 # --- DATA PERSISTENCE ---
@@ -121,7 +129,7 @@ def download_media(url, mode='best'):
     if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
     timestamp = int(time.time())
     
-    # Resolve Link
+    # Clean URL using new logic
     final_url = resolve_url(url)
 
     ydl_opts = {
@@ -227,9 +235,8 @@ async def process_download(update, context, url, quality, wait_msg, user_id):
             increment_download(user_id)
             await wait_msg.delete()
         else:
-            # Clean Error Message
             clean_error = str(error_msg).replace(os.getcwd(), "")[:200]
-            await wait_msg.edit_text(f"❌ **Failed.**\n\n`{clean_error}`", parse_mode=ParseMode.MARKDOWN)
+            await wait_msg.edit_text(f"❌ **Failed.**\n`{clean_error}`", parse_mode=ParseMode.MARKDOWN)
             
     except Exception as e:
         logger.error(f"Process Error: {e}")
