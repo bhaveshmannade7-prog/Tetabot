@@ -5,7 +5,9 @@ import time
 import shutil
 import signal
 import sys
-from flask import Flask, request
+import json
+from datetime import date
+from flask import Flask, request  # Flask request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
@@ -18,33 +20,32 @@ nest_asyncio.apply()
 
 # 1. Credentials
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL") # Render ke liye zaroori
-OWNER_ID = int(os.getenv("OWNER_ID", "0")) # Apna Telegram ID yahan daalein (Env var me)
+WEBHOOK_URL = os.getenv("WEBHOOK_URL") 
+OWNER_ID = int(os.getenv("OWNER_ID", "0")) 
 
 # 2. Mode Selection (Standard vs Local)
-# Render par 'standard' rakhein. AWS par 'local' set karein.
 API_MODE = os.getenv("API_MODE", "standard") 
 
 if API_MODE == 'local':
-    # AWS EC2 Local Server URL (Default port 8081)
+    # AWS EC2 Local Server URL
     BASE_URL = "http://localhost:8081/bot"
-    MAX_FILE_SIZE = 1950 * 1024 * 1024 # 1.95 GB (Safe limit)
+    MAX_FILE_SIZE = 1950 * 1024 * 1024 
     logger_msg = "🚀 Running in LOCAL SERVER Mode (2GB Support)"
 else:
     # Standard Telegram API
     BASE_URL = None 
-    MAX_FILE_SIZE = 49 * 1024 * 1024 # 49 MB
+    MAX_FILE_SIZE = 49 * 1024 * 1024 
     logger_msg = "⚠️ Running in STANDARD Mode (50MB Limit)"
 
 # Constants
 DOWNLOAD_DIR = "downloads"
+DATA_FILE = "data.json"
 
 # Logging
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 logger.info(logger_msg)
 
-# Global Flag for Stop Command
 IS_STOPPED = False
 
 # --- FLASK (For Render Webhook) ---
@@ -63,7 +64,6 @@ def download_video(url, quality):
     if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
     timestamp = int(time.time())
     
-    # 1080p/2k/4k ke liye 'bestvideo' use karte hain (sound merge karni padti hai)
     format_str = ""
     if quality == 'audio':
         format_str = 'bestaudio/best'
@@ -74,7 +74,7 @@ def download_video(url, quality):
     elif quality == '1080':
         format_str = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]'
     elif quality == 'best':
-        format_str = 'bestvideo+bestaudio/best' # For 1GB+ Quality
+        format_str = 'bestvideo+bestaudio/best'
 
     ydl_opts = {
         'outtmpl': f'{DOWNLOAD_DIR}/%(id)s_{timestamp}.%(ext)s',
@@ -83,13 +83,11 @@ def download_video(url, quality):
         'no_warnings': True,
         'nocheckcertificate': True,
         'geo_bypass': True,
-        # Agar AWS par hain to ffmpeg location deni pad sakti hai (usually auto-detect hota hai)
     }
 
     if quality == 'audio':
         ydl_opts['postprocessors'] = [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}]
     else:
-        # Video ke liye MP4 container ensure karein
         ydl_opts['merge_output_format'] = 'mp4'
 
     try:
@@ -97,16 +95,13 @@ def download_video(url, quality):
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
             
-            # Merge extension fix
             base, ext = os.path.splitext(filename)
             if quality == 'audio':
                 final_name = base + ".mp3"
             else:
                 final_name = base + ".mp4"
             
-            # Check if file exists (yt-dlp sometimes changes extensions)
             if not os.path.exists(final_name):
-                # Fallback check
                 if os.path.exists(filename): final_name = filename
             
             return final_name, info.get('title', 'Video'), info.get('duration'), info.get('width'), info.get('height')
@@ -126,7 +121,6 @@ async def stop_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global IS_STOPPED
     IS_STOPPED = True
     await update.message.reply_text("🛑 **Bot Stopping...**\nSabhi process rok diye gaye hain.\n(Restart ke liye deploy dobara karein)")
-    # Force kill python process to stop heavy downloads
     os._exit(0)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -138,7 +132,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data['url'] = url
     
-    # Quality Keyboard
     keyboard = [
         [InlineKeyboardButton("🎵 Audio (MP3)", callback_data="audio")],
         [InlineKeyboardButton("360p", callback_data="360"), InlineKeyboardButton("720p", callback_data="720")],
@@ -156,14 +149,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     status_msg = await query.edit_message_text(f"⏳ **Downloading {quality.upper()}...**\n(Ye process lamba chal sakta hai)")
 
-    # Run Download
-    # Note: Badi files ke liye ye blocking ho sakta hai, par personal bot ke liye theek hai
     path, title, duration, w, h = download_video(url, quality)
 
     if path and os.path.exists(path):
         file_size = os.path.getsize(path)
         
-        # Limit Check
         if file_size > MAX_FILE_SIZE:
             await status_msg.edit_text(f"❌ **File Too Big!**\nSize: {round(file_size/(1024*1024))}MB\nAllowed: {round(MAX_FILE_SIZE/(1024*1024))}MB\n\n(AWS Local Server Setup karein 1GB+ ke liye)")
             os.remove(path)
@@ -187,17 +177,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text("❌ Download Failed.")
 
 # --- INITIALIZATION ---
-# Request Timeout badhana zaroori hai badi files ke liye
-request = HTTPXRequest(connection_pool_size=8, read_timeout=1200, write_timeout=1200)
+# Renamed variable from 'request' to 'ptb_request' to avoid conflict with Flask 'request'
+ptb_request = HTTPXRequest(connection_pool_size=8, read_timeout=1200, write_timeout=1200)
 
 if BASE_URL:
-    # AWS Local Server Mode
-    ptb_application = Application.builder().token(BOT_TOKEN).base_url(BASE_URL).request(request).build()
+    ptb_application = Application.builder().token(BOT_TOKEN).base_url(BASE_URL).request(ptb_request).build()
 else:
-    # Render Standard Mode
-    ptb_application = Application.builder().token(BOT_TOKEN).request(request).build()
+    ptb_application = Application.builder().token(BOT_TOKEN).request(ptb_request).build()
 
-# Handlers
 ptb_application.add_handler(CommandHandler("start", start))
 ptb_application.add_handler(CommandHandler("stop", stop_bot))
 ptb_application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -205,7 +192,6 @@ ptb_application.add_handler(CallbackQueryHandler(button_handler))
 
 async def setup_bot():
     await ptb_application.initialize()
-    # Webhook Setup (Dono environments ke liye)
     if WEBHOOK_URL:
         await ptb_application.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
     
