@@ -13,10 +13,8 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 import yt_dlp
-import nest_asyncio
 
 # --- CONFIGURATION ---
-nest_asyncio.apply()
 
 # 1. Credentials
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -121,7 +119,8 @@ async def stop_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global IS_STOPPED
     IS_STOPPED = True
     await update.message.reply_text("🛑 **Bot Stopping...**\nSabhi process rok diye gaye hain.\n(Restart ke liye deploy dobara karein)")
-    os._exit(0)
+    # We do NOT exit here on Render as it kills the webhook handler. 
+    # Just setting the flag is enough to stop processing.
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if IS_STOPPED: return
@@ -142,18 +141,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if IS_STOPPED: return
     query = update.callback_query
-    await query.answer()
+    # We need to wrap answer in try-except because of potential network timeouts
+    try:
+        await query.answer()
+    except:
+        pass
     
     quality = query.data
     url = context.user_data.get('url')
     
     status_msg = await query.edit_message_text(f"⏳ **Downloading {quality.upper()}...**\n(Ye process lamba chal sakta hai)")
 
+    # Run Download
     path, title, duration, w, h = download_video(url, quality)
 
     if path and os.path.exists(path):
         file_size = os.path.getsize(path)
         
+        # Limit Check
         if file_size > MAX_FILE_SIZE:
             await status_msg.edit_text(f"❌ **File Too Big!**\nSize: {round(file_size/(1024*1024))}MB\nAllowed: {round(MAX_FILE_SIZE/(1024*1024))}MB\n\n(AWS Local Server Setup karein 1GB+ ke liye)")
             os.remove(path)
@@ -168,16 +173,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     await context.bot.send_video(chat_id=OWNER_ID, video=f, caption=title, supports_streaming=True, width=w, height=h, duration=duration, read_timeout=1200, write_timeout=1200)
             
-            await status_msg.delete()
+            # Clean up message
+            try:
+                await status_msg.delete()
+            except:
+                pass
+                
         except Exception as e:
-            await status_msg.edit_text(f"❌ Upload Error: {e}")
+            logger.error(f"Upload Error: {e}")
+            await status_msg.edit_text(f"❌ Upload Error: {str(e)}")
         finally:
             if os.path.exists(path): os.remove(path)
     else:
         await status_msg.edit_text("❌ Download Failed.")
 
 # --- INITIALIZATION ---
-# Renamed variable from 'request' to 'ptb_request' to avoid conflict with Flask 'request'
+# Using custom request to handle large file timeouts
 ptb_request = HTTPXRequest(connection_pool_size=8, read_timeout=1200, write_timeout=1200)
 
 if BASE_URL:
@@ -190,29 +201,42 @@ ptb_application.add_handler(CommandHandler("stop", stop_bot))
 ptb_application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 ptb_application.add_handler(CallbackQueryHandler(button_handler))
 
-async def setup_bot():
+# Helper to initialize bot on startup
+async def init_bot():
     await ptb_application.initialize()
     if WEBHOOK_URL:
         await ptb_application.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
-    
-    logger.info("✅ Bot Started Successfully")
+    logger.info("✅ Bot & Webhook Initialized")
+
+# Create a new event loop for initialization
+try:
+    loop = asyncio.get_event_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+loop.run_until_complete(init_bot())
 
 @app.route('/webhook', methods=['POST'])
 def webhook_handler():
     if request.method == "POST":
         data = request.get_json(force=True)
         update = Update.de_json(data, ptb_application.bot)
-        asyncio.run(ptb_application.process_update(update))
+        
+        # Proper way to run async function inside sync Flask route
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+        loop.run_until_complete(ptb_application.process_update(update))
         return "OK"
     return "Invalid"
 
+@app.route('/')
+def index():
+    return "Bot is Running"
+
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(setup_bot())
     app.run(port=5000)
-else:
-    try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(setup_bot())
-    except: pass
