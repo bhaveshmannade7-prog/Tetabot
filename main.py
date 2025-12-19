@@ -37,72 +37,88 @@ PROCESSING_QUEUE = set()
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- SMART COOKIE DOCTOR (Fixes Spaces & Domains) ---
+# --- SMART COOKIE DOCTOR (Fixes Spaces/Tabs Issue) ---
 def setup_cookies():
+    """
+    Ye function ENV variable se gande format wali cookies leta hai
+    aur unhe saaf-suthra karke TAB-SEPARATED file banata hai.
+    """
     if not COOKIES_ENV or len(COOKIES_ENV) < 10:
-        logger.warning("⚠️ COOKIES_CONTENT is empty!")
+        logger.warning("⚠️ COOKIES_CONTENT is empty or too short!")
         return
 
     try:
-        logger.info("🔧 Fixing Cookies Domains & Format...")
+        logger.info("🔧 Starting Cookie Doctor...")
         valid_lines = []
+        
+        # Header zaroori hai
         valid_lines.append("# Netscape HTTP Cookie File")
         valid_lines.append("# This is a generated file!  Do not edit.")
         
+        # Line by line fix karo
         lines = COOKIES_ENV.split('\n')
         for line in lines:
             line = line.strip()
+            # Comments aur empty lines chhodo
             if not line or line.startswith('#'):
                 continue
             
+            # Agar user ne space copy kiya hai, toh usse split karo
             parts = line.split()
+            
+            # Netscape cookie me 7 columns hote hain
+            # domain, flag, path, secure, expiry, name, value
             if len(parts) >= 7:
-                # 1. DOMAIN FIX: .1024terabox -> .terabox
+                # Column 0-5 fix hote hain
                 domain = parts[0]
+                
+                # Domain Fix: .1024terabox -> .terabox
                 if "1024terabox" in domain:
                     domain = domain.replace("1024terabox", "terabox")
-                
-                flag = parts[1].upper()
+
+                flag = parts[1].upper() 
                 path = parts[2]
                 secure = parts[3].upper()
                 expiry = parts[4]
                 name = parts[5]
-                value = "".join(parts[6:])
+                value = "".join(parts[6:]) # Baki sab value hai
                 
-                # 2. Reconstruct with TABS
+                # Ab beech me TAB (\t) lagakar jodo
                 fixed_line = f"{domain}\t{flag}\t{path}\t{secure}\t{expiry}\t{name}\t{value}"
                 valid_lines.append(fixed_line)
         
+        # File me likho
         with open(COOKIE_FILE, 'w') as f:
             f.write("\n".join(valid_lines))
             f.write("\n")
             
-        logger.info(f"✅ Cookies Fixed! Domains normalized to .terabox.com")
+        logger.info(f"✅ Cookies Fixed! Total {len(valid_lines)} valid cookies saved to {COOKIE_FILE}")
         
     except Exception as e:
         logger.error(f"❌ Cookie Doctor Failed: {e}")
 
-# Run immediately
+# Start hote hi Cookies fix karo
 setup_cookies()
 
 # --- HELPER: URL RESOLVER ---
 def resolve_url(url):
     try:
-        # TeraBox Fixes
+        # TeraBox Specific Fixes
         if "terabox" in url or "terashare" in url or "1024tera" in url:
             
-            # Shortener check
+            # Shortener check (teraboxurl.com etc)
             if "teraboxurl" in url:
                 try:
                     resp = requests.head(url, allow_redirects=True, timeout=5)
                     url = resp.url
                 except: pass
 
-            # 'surl' pattern extraction
+            # 'surl' pattern fix
             match = re.search(r'surl=([a-zA-Z0-9_-]+)', url)
             if match:
                 return f"https://www.terabox.com/s/1{match.group(1)}"
 
+        # Domain Standardize
         if "terabox.app" in url:
             return url.replace("terabox.app", "terabox.com")
             
@@ -110,21 +126,29 @@ def resolve_url(url):
     except:
         return url
 
-# --- DATA HANDLING ---
+# --- DATA HANDLING (FIXED SYNTAX HERE) ---
 def load_data():
-    if not os.path.exists(DATA_FILE): return {}
-    try: with open(DATA_FILE, 'r') as f: return json.load(f)
-    except: return {}
+    if not os.path.exists(DATA_FILE):
+        return {}
+    try:
+        with open(DATA_FILE, 'r') as f:
+            return json.load(f)
+    except:
+        return {}
 
 def save_data(data):
-    try: with open(DATA_FILE, 'w') as f: json.dump(data, f, indent=4)
-    except: pass
+    try:
+        with open(DATA_FILE, 'w') as f:
+            json.dump(data, f, indent=4)
+    except:
+        pass
 
 def get_user_data(user_id):
     data = load_data()
     str_id = str(user_id)
     today = str(date.today())
-    if str_id not in data: data[str_id] = {"premium": False, "date": today, "count": 0}
+    if str_id not in data:
+        data[str_id] = {"premium": False, "date": today, "count": 0}
     if data[str_id]["date"] != today:
         data[str_id]["date"] = today
         data[str_id]["count"] = 0
@@ -142,68 +166,81 @@ ptb_application = Application.builder().token(BOT_TOKEN).build()
 
 # --- HELPER ---
 async def check_subscription(user_id, bot):
-    if not REQUIRED_CHANNEL: return True
+    if not REQUIRED_CHANNEL:
+        return True
     try:
         member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=user_id)
-        if member.status in ["left", "kicked"]: return False
+        if member.status in ["left", "kicked"]:
+            return False
         return True
-    except: return True
+    except:
+        return True
 
 # --- DOWNLOADER ENGINE ---
 def download_media(url, mode='best'):
-    if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
+    if not os.path.exists(DOWNLOAD_DIR):
+        os.makedirs(DOWNLOAD_DIR)
     timestamp = int(time.time())
     
     final_url = resolve_url(url)
-    logger.info(f"Target URL: {final_url}")
+    logger.info(f"Downloading: {final_url}")
 
+    # CONFIGURATION
     ydl_opts = {
         'outtmpl': f'{DOWNLOAD_DIR}/%(id)s_{timestamp}.%(ext)s',
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
-        # IMPORTANT: User Agent MUST match the one used to export cookies
+        # Desktop UA helps with TeraBox
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'http_headers': {
             'Referer': 'https://www.terabox.com/',
         },
         'ignoreerrors': True,
+        'allow_unplayable_formats': True,
     }
 
-    if "diskwala" not in final_url and os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 50:
-        ydl_opts['cookiefile'] = COOKIE_FILE
+    # Cookies check
+    if "diskwala" not in final_url and os.path.exists(COOKIE_FILE):
+        if os.path.getsize(COOKIE_FILE) > 50: # Check file not empty
+            ydl_opts['cookiefile'] = COOKIE_FILE
+        else:
+            logger.warning("Cookie file created but empty.")
 
+    # Modes
     if mode == 'audio':
-        ydl_opts.update({'format': 'bestaudio/best', 'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}]})
+        ydl_opts.update({
+            'format': 'bestaudio/best',
+            'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}]
+        })
     else:
-        ydl_opts.update({'format': 'best[ext=mp4][filesize<50M]/best[filesize<50M]/best'})
+        ydl_opts.update({
+            'format': 'best[ext=mp4][filesize<50M]/best[filesize<50M]/best'
+        })
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
                 info = ydl.extract_info(final_url, download=True)
             except Exception as e:
-                # Last resort: Try without cookies if IP mismatch blocks it
-                if "cookie" in str(e).lower() or "expire" in str(e).lower():
-                    logger.warning("Cookies rejected (IP Mismatch). Trying anonymous.")
-                    if 'cookiefile' in ydl_opts: del ydl_opts['cookiefile']
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl2:
-                        info = ydl2.extract_info(final_url, download=True)
-                else:
-                    return None, None, None, None, None, str(e)
+                # Agar Cookie fail hui, toh error return karo
+                return None, None, None, None, None, str(e)
 
-            if not info: return None, None, None, None, None, "Extraction Failed"
+            if not info:
+                return None, None, None, None, None, "Extraction Failed (Cookies expired or invalid)"
 
             filename = ydl.prepare_filename(info)
             base, ext = os.path.splitext(filename)
             
+            # Check for file
             if not os.path.exists(filename):
                 for ext in ['.mp4', '.mkv', '.webm', '.mp3']:
                     if os.path.exists(base + ext):
                         filename = base + ext
                         break
             
-            if not os.path.exists(filename): return None, None, None, None, None, "File Missing"
+            if not os.path.exists(filename):
+                 return None, None, None, None, None, "File Missing (Download incomplete)"
 
             return filename, info.get('title', 'Media'), info.get('duration'), info.get('width'), info.get('height'), None
 
@@ -217,12 +254,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     update_id = update.update_id
-    if update_id in PROCESSING_QUEUE: return
+    if update_id in PROCESSING_QUEUE:
+        return
     PROCESSING_QUEUE.add(update_id)
 
     try:
         url = update.message.text.strip()
-        if "http" not in url: return
+        if "http" not in url:
+            return
         
         if not await check_subscription(user_id, context.bot):
             await update.message.reply_text(f"🚫 Join {REQUIRED_CHANNEL} first.")
@@ -245,7 +284,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Handler Error: {e}")
     finally:
-        if update_id in PROCESSING_QUEUE: PROCESSING_QUEUE.remove(update_id)
+        if update_id in PROCESSING_QUEUE:
+            PROCESSING_QUEUE.remove(update_id)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -274,23 +314,35 @@ async def process_download(update, context, url, quality, wait_msg, user_id):
                 if quality == 'audio':
                     await context.bot.send_audio(chat_id=user_id, audio=f, title=title)
                 else:
-                    await context.bot.send_video(chat_id=user_id, video=f, caption=title, supports_streaming=True, width=width, height=height, duration=duration, read_timeout=120, write_timeout=120)
+                    await context.bot.send_video(
+                        chat_id=user_id, 
+                        video=f, 
+                        caption=title, 
+                        supports_streaming=True, 
+                        width=width, 
+                        height=height, 
+                        duration=duration, 
+                        read_timeout=120, 
+                        write_timeout=120
+                    )
             increment_download(user_id)
             await wait_msg.delete()
         else:
-            clean_error = str(error_msg).replace(os.getcwd(), "")[-250:]
-            if "Login Failed" in str(error_msg) or "Extraction Failed" in str(error_msg):
-                clean_error = "TeraBox blocked access (IP Mismatch). Try updating cookies via VPN (USA)."
+            clean_error = str(error_msg).replace(os.getcwd(), "")[-300:]
             await wait_msg.edit_text(f"❌ **Failed.**\n\nLog: `{clean_error}`", parse_mode=ParseMode.MARKDOWN)
             
     except Exception as e:
         logger.error(f"Process Error: {e}")
-        try: await wait_msg.edit_text("❌ Bot Processing Error.")
-        except: pass
+        try:
+            await wait_msg.edit_text("❌ Internal Bot Error.")
+        except:
+            pass
     finally:
         if file_path and os.path.exists(file_path): 
-            try: os.remove(file_path)
-            except: pass
+            try:
+                os.remove(file_path)
+            except:
+                pass
 
 # --- SETUP ---
 ptb_application.add_handler(CommandHandler("start", start))
@@ -308,7 +360,8 @@ def webhook_handler():
     if request.method == "POST":
         data = request.get_json(force=True)
         update = Update.de_json(data, ptb_application.bot)
-        if update.update_id in PROCESSING_QUEUE: return "OK"
+        if update.update_id in PROCESSING_QUEUE:
+            return "OK"
         asyncio.run(ptb_application.process_update(update))
         return "OK"
     return "Invalid"
@@ -322,4 +375,5 @@ else:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(setup_bot())
-    except: pass
+    except:
+        pass
