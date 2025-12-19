@@ -4,7 +4,6 @@ import asyncio
 import json
 import time
 import shutil
-import requests
 import re
 from datetime import datetime, date
 from flask import Flask, request
@@ -45,45 +44,25 @@ if COOKIES_ENV and not os.path.exists(COOKIE_FILE):
     except:
         pass
 
-# --- HELPER: ULTIMATE URL RESOLVER ---
-def resolve_url(url):
-    try:
-        logger.info(f"Original URL: {url}")
-        
-        # 1. TeraBox 'surl' Fix
-        if "terabox" in url or "terashare" in url or "1024tera" in url:
-            # Direct String Manipulation
-            if "surl=" in url:
-                match = re.search(r'surl=([a-zA-Z0-9_-]+)', url)
-                if match:
-                    code = match.group(1)
-                    final_url = f"https://www.terabox.com/s/1{code}"
-                    logger.info(f"Fixed 'surl' Link -> {final_url}")
-                    return final_url
-            
-            # Shortener check
-            if "teraboxurl" in url:
-                try:
-                    resp = requests.head(url, allow_redirects=True, timeout=5)
-                    resolved = resp.url
-                    if "surl=" in resolved:
-                        match = re.search(r'surl=([a-zA-Z0-9_-]+)', resolved)
-                        if match:
-                            return f"https://www.terabox.com/s/1{match.group(1)}"
-                    return resolved
-                except:
-                    pass
+# --- URL FIXER ---
+def fix_terabox_url(url):
+    # 1. 'surl' pattern fix (Direct String Manipulation)
+    # Agar url me surl= hai to use /s/1... me badal do
+    if "surl=" in url:
+        match = re.search(r'surl=([a-zA-Z0-9_-]+)', url)
+        if match:
+            return f"https://www.terabox.com/s/1{match.group(1)}"
+    
+    # 2. Domain Standardize
+    if "terabox.app" in url or "1024tera.com" in url or "teraboxurl.com" in url:
+        # Domain ko standard terabox.com banate hain taaki cookies match karein
+        url = url.replace("terabox.app", "terabox.com")\
+                 .replace("1024tera.com", "terabox.com")\
+                 .replace("teraboxurl.com", "terabox.com")
+                 
+    return url
 
-        # 2. Domain Corrections
-        if "terabox.app" in url:
-            return url.replace("terabox.app", "terabox.com")
-            
-        return url
-    except Exception as e:
-        logger.error(f"URL Fix Error: {e}")
-        return url
-
-# --- DATA PERSISTENCE (FIXED SYNTAX) ---
+# --- DATA PERSISTENCE ---
 def load_data():
     if not os.path.exists(DATA_FILE):
         return {}
@@ -139,48 +118,63 @@ def download_media(url, mode='best'):
         os.makedirs(DOWNLOAD_DIR)
     timestamp = int(time.time())
     
-    # 1. Fix URL Format
-    final_url = resolve_url(url)
-    logger.info(f"Passing to yt-dlp: {final_url}")
+    # URL Fix
+    final_url = fix_terabox_url(url)
+    logger.info(f"Target URL: {final_url}")
 
-    # 2. Configure Options
+    # CONFIGURATION (Crucial for TeraBox)
     ydl_opts = {
         'outtmpl': f'{DOWNLOAD_DIR}/%(id)s_{timestamp}.%(ext)s',
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+        # KEY FIX: Use Desktop User Agent to prevent redirect to /sharing/link
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'referer': 'https://www.terabox.com/',
         'allow_unplayable_formats': True,
         'ignoreerrors': True,
     }
 
-    # Cookies check
+    # Cookies Check
     if "diskwala" not in final_url and os.path.exists(COOKIE_FILE):
         ydl_opts['cookiefile'] = COOKIE_FILE
 
-    # Mode Selection
+    # Modes
     if mode == 'audio':
         ydl_opts.update({
             'format': 'bestaudio/best',
             'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}]
         })
     else:
+        # Try MP4 first, then fallback
         ydl_opts.update({
             'format': 'best[ext=mp4][filesize<50M]/best[filesize<50M]/best'
         })
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(final_url, download=True)
-            
-            if not info:
-                return None, None, None, None, None, "Extraction Failed"
+            # 1. Info Extract
+            try:
+                info = ydl.extract_info(final_url, download=True)
+            except Exception as e:
+                return None, None, None, None, None, str(e)
 
+            if not info:
+                return None, None, None, None, None, "Extraction Failed (Login/Captcha issue)"
+
+            # 2. Filename
             filename = ydl.prepare_filename(info)
-            
             base, ext = os.path.splitext(filename)
             final_filename = base + ".mp3" if mode == 'audio' else filename
             
+            # Verify file exists
+            if not os.path.exists(filename):
+                # Sometimes yt-dlp merges video+audio and name changes to .mkv
+                if os.path.exists(base + ".mkv"):
+                    filename = base + ".mkv"
+                elif os.path.exists(base + ".webm"):
+                    filename = base + ".webm"
+
             return filename, info.get('title', 'Media'), info.get('duration'), info.get('width'), info.get('height'), None
 
     except Exception as e:
@@ -188,7 +182,7 @@ def download_media(url, mode='best'):
 
 # --- HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 **Bot Ready!**\nSupports: YouTube, TeraBox, Diskwala.", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("👋 **Bot Ready!**\n\nSupports: YouTube, TeraBox, Diskwala.\n(Desktop Mode Enabled)", parse_mode=ParseMode.MARKDOWN)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -253,15 +247,22 @@ async def process_download(update, context, url, quality, wait_msg, user_id):
                 if quality == 'audio':
                     await context.bot.send_audio(chat_id=user_id, audio=f, title=title)
                 else:
-                    await context.bot.send_video(chat_id=user_id, video=f, caption=title, supports_streaming=True, width=width, height=height, duration=duration, read_timeout=120, write_timeout=120)
+                    await context.bot.send_video(
+                        chat_id=user_id, 
+                        video=f, 
+                        caption=title, 
+                        supports_streaming=True, 
+                        width=width, 
+                        height=height, 
+                        duration=duration, 
+                        read_timeout=120, 
+                        write_timeout=120
+                    )
             increment_download(user_id)
             await wait_msg.delete()
         else:
-            clean_error = str(error_msg).replace(os.getcwd(), "")[:300]
-            tip = ""
-            if "Sign in" in str(error_msg):
-                tip = "\n💡 **Tip:** Cookies Expired."
-            await wait_msg.edit_text(f"❌ **Failed.**\n\nError: `{clean_error}`{tip}", parse_mode=ParseMode.MARKDOWN)
+            clean_error = str(error_msg).replace(os.getcwd(), "")[-300:]
+            await wait_msg.edit_text(f"❌ **Failed.**\n\nLog: `{clean_error}`", parse_mode=ParseMode.MARKDOWN)
             
     except Exception as e:
         logger.error(f"Process Error: {e}")
@@ -309,3 +310,4 @@ else:
         loop.run_until_complete(setup_bot())
     except:
         pass
+    
