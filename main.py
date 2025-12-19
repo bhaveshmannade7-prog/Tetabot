@@ -1,367 +1,221 @@
 import os
 import logging
 import asyncio
-import json
 import time
 import shutil
-import requests
-import re
-from datetime import datetime, date
+import signal
+import sys
 from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.request import HTTPXRequest
 import yt_dlp
 import nest_asyncio
 
 # --- CONFIGURATION ---
 nest_asyncio.apply()
 
-# Load Env Vars
+# 1. Credentials
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  
-REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "") 
-COOKIES_ENV = os.getenv("COOKIES_CONTENT")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL") # Render ke liye zaroori
+OWNER_ID = int(os.getenv("OWNER_ID", "0")) # Apna Telegram ID yahan daalein (Env var me)
+
+# 2. Mode Selection (Standard vs Local)
+# Render par 'standard' rakhein. AWS par 'local' set karein.
+API_MODE = os.getenv("API_MODE", "standard") 
+
+if API_MODE == 'local':
+    # AWS EC2 Local Server URL (Default port 8081)
+    BASE_URL = "http://localhost:8081/bot"
+    MAX_FILE_SIZE = 1950 * 1024 * 1024 # 1.95 GB (Safe limit)
+    logger_msg = "🚀 Running in LOCAL SERVER Mode (2GB Support)"
+else:
+    # Standard Telegram API
+    BASE_URL = None 
+    MAX_FILE_SIZE = 49 * 1024 * 1024 # 49 MB
+    logger_msg = "⚠️ Running in STANDARD Mode (50MB Limit)"
 
 # Constants
 DOWNLOAD_DIR = "downloads"
-DATA_FILE = "data.json"
-COOKIE_FILE = "cookies.txt"
-DAILY_LIMIT = 50
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB Limit
-
-PROCESSING_QUEUE = set()
 
 # Logging
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+logger.info(logger_msg)
 
-# --- SMART COOKIE DOCTOR (Fixes Spaces/Tabs Issue) ---
-def setup_cookies():
-    """
-    Ye function ENV variable se gande format wali cookies leta hai
-    aur unhe saaf-suthra karke TAB-SEPARATED file banata hai.
-    """
-    if not COOKIES_ENV or len(COOKIES_ENV) < 10:
-        logger.warning("⚠️ COOKIES_CONTENT is empty or too short!")
-        return
+# Global Flag for Stop Command
+IS_STOPPED = False
 
-    try:
-        logger.info("🔧 Starting Cookie Doctor...")
-        valid_lines = []
-        
-        # Header zaroori hai
-        valid_lines.append("# Netscape HTTP Cookie File")
-        valid_lines.append("# This is a generated file!  Do not edit.")
-        
-        # Line by line fix karo
-        lines = COOKIES_ENV.split('\n')
-        for line in lines:
-            line = line.strip()
-            # Comments aur empty lines chhodo
-            if not line or line.startswith('#'):
-                continue
-            
-            # Agar user ne space copy kiya hai, toh usse split karo
-            parts = line.split()
-            
-            # Netscape cookie me 7 columns hote hain
-            # domain, flag, path, secure, expiry, name, value
-            if len(parts) >= 7:
-                # Column 0-5 fix hote hain
-                domain = parts[0]
-                
-                # Domain Fix: .1024terabox -> .terabox
-                if "1024terabox" in domain:
-                    domain = domain.replace("1024terabox", "terabox")
-
-                flag = parts[1].upper() 
-                path = parts[2]
-                secure = parts[3].upper()
-                expiry = parts[4]
-                name = parts[5]
-                value = "".join(parts[6:]) # Baki sab value hai
-                
-                # Ab beech me TAB (\t) lagakar jodo
-                fixed_line = f"{domain}\t{flag}\t{path}\t{secure}\t{expiry}\t{name}\t{value}"
-                valid_lines.append(fixed_line)
-        
-        # File me likho
-        with open(COOKIE_FILE, 'w') as f:
-            f.write("\n".join(valid_lines))
-            f.write("\n")
-            
-        logger.info(f"✅ Cookies Fixed! Total {len(valid_lines)} valid cookies saved to {COOKIE_FILE}")
-        
-    except Exception as e:
-        logger.error(f"❌ Cookie Doctor Failed: {e}")
-
-# Start hote hi Cookies fix karo
-setup_cookies()
-
-# --- HELPER: URL RESOLVER ---
-def resolve_url(url):
-    try:
-        # TeraBox Specific Fixes
-        if "terabox" in url or "terashare" in url or "1024tera" in url:
-            
-            # Shortener check (teraboxurl.com etc)
-            if "teraboxurl" in url:
-                try:
-                    resp = requests.head(url, allow_redirects=True, timeout=5)
-                    url = resp.url
-                except: pass
-
-            # 'surl' pattern fix
-            match = re.search(r'surl=([a-zA-Z0-9_-]+)', url)
-            if match:
-                return f"https://www.terabox.com/s/1{match.group(1)}"
-
-        # Domain Standardize
-        if "terabox.app" in url:
-            return url.replace("terabox.app", "terabox.com")
-            
-        return url
-    except:
-        return url
-
-# --- DATA HANDLING (FIXED SYNTAX HERE) ---
-def load_data():
-    if not os.path.exists(DATA_FILE):
-        return {}
-    try:
-        with open(DATA_FILE, 'r') as f:
-            return json.load(f)
-    except:
-        return {}
-
-def save_data(data):
-    try:
-        with open(DATA_FILE, 'w') as f:
-            json.dump(data, f, indent=4)
-    except:
-        pass
-
-def get_user_data(user_id):
-    data = load_data()
-    str_id = str(user_id)
-    today = str(date.today())
-    if str_id not in data:
-        data[str_id] = {"premium": False, "date": today, "count": 0}
-    if data[str_id]["date"] != today:
-        data[str_id]["date"] = today
-        data[str_id]["count"] = 0
-        save_data(data)
-    return data, data[str_id]
-
-def increment_download(user_id):
-    data, user = get_user_data(user_id)
-    data[str(user_id)]["count"] += 1
-    save_data(data)
-
-# --- FLASK ---
+# --- FLASK (For Render Webhook) ---
 app = Flask(__name__)
-ptb_application = Application.builder().token(BOT_TOKEN).build()
 
-# --- HELPER ---
-async def check_subscription(user_id, bot):
-    if not REQUIRED_CHANNEL:
-        return True
-    try:
-        member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=user_id)
-        if member.status in ["left", "kicked"]:
-            return False
-        return True
-    except:
-        return True
+# --- AUTH CHECK ---
+async def check_auth(update: Update):
+    user_id = update.effective_user.id
+    if user_id != OWNER_ID:
+        await update.message.reply_text("⛔ **Access Denied!**\nYe bot personal use ke liye hai.")
+        return False
+    return True
 
-# --- DOWNLOADER ENGINE ---
-def download_media(url, mode='best'):
-    if not os.path.exists(DOWNLOAD_DIR):
-        os.makedirs(DOWNLOAD_DIR)
+# --- YOUTUBE ENGINE ---
+def download_video(url, quality):
+    if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
     timestamp = int(time.time())
     
-    final_url = resolve_url(url)
-    logger.info(f"Downloading: {final_url}")
+    # 1080p/2k/4k ke liye 'bestvideo' use karte hain (sound merge karni padti hai)
+    format_str = ""
+    if quality == 'audio':
+        format_str = 'bestaudio/best'
+    elif quality == '360':
+        format_str = 'bestvideo[height<=360]+bestaudio/best[height<=360]'
+    elif quality == '720':
+        format_str = 'bestvideo[height<=720]+bestaudio/best[height<=720]'
+    elif quality == '1080':
+        format_str = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]'
+    elif quality == 'best':
+        format_str = 'bestvideo+bestaudio/best' # For 1GB+ Quality
 
-    # CONFIGURATION
     ydl_opts = {
         'outtmpl': f'{DOWNLOAD_DIR}/%(id)s_{timestamp}.%(ext)s',
+        'format': format_str,
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
-        # Desktop UA helps with TeraBox
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'http_headers': {
-            'Referer': 'https://www.terabox.com/',
-        },
-        'ignoreerrors': True,
-        'allow_unplayable_formats': True,
+        'geo_bypass': True,
+        # Agar AWS par hain to ffmpeg location deni pad sakti hai (usually auto-detect hota hai)
     }
 
-    # Cookies check
-    if "diskwala" not in final_url and os.path.exists(COOKIE_FILE):
-        if os.path.getsize(COOKIE_FILE) > 50: # Check file not empty
-            ydl_opts['cookiefile'] = COOKIE_FILE
-        else:
-            logger.warning("Cookie file created but empty.")
-
-    # Modes
-    if mode == 'audio':
-        ydl_opts.update({
-            'format': 'bestaudio/best',
-            'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}]
-        })
+    if quality == 'audio':
+        ydl_opts['postprocessors'] = [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}]
     else:
-        ydl_opts.update({
-            'format': 'best[ext=mp4][filesize<50M]/best[filesize<50M]/best'
-        })
+        # Video ke liye MP4 container ensure karein
+        ydl_opts['merge_output_format'] = 'mp4'
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
-                info = ydl.extract_info(final_url, download=True)
-            except Exception as e:
-                # Agar Cookie fail hui, toh error return karo
-                return None, None, None, None, None, str(e)
-
-            if not info:
-                return None, None, None, None, None, "Extraction Failed (Cookies expired or invalid)"
-
+            info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
+            
+            # Merge extension fix
             base, ext = os.path.splitext(filename)
+            if quality == 'audio':
+                final_name = base + ".mp3"
+            else:
+                final_name = base + ".mp4"
             
-            # Check for file
-            if not os.path.exists(filename):
-                for ext in ['.mp4', '.mkv', '.webm', '.mp3']:
-                    if os.path.exists(base + ext):
-                        filename = base + ext
-                        break
+            # Check if file exists (yt-dlp sometimes changes extensions)
+            if not os.path.exists(final_name):
+                # Fallback check
+                if os.path.exists(filename): final_name = filename
             
-            if not os.path.exists(filename):
-                 return None, None, None, None, None, "File Missing (Download incomplete)"
-
-            return filename, info.get('title', 'Media'), info.get('duration'), info.get('width'), info.get('height'), None
-
+            return final_name, info.get('title', 'Video'), info.get('duration'), info.get('width'), info.get('height')
+            
     except Exception as e:
-        return None, None, None, None, None, str(e)
+        logger.error(f"Download Error: {e}")
+        return None, None, None, None, None
 
 # --- HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 **Bot Ready!**\n\nSupports: YouTube, TeraBox, Diskwala.", parse_mode=ParseMode.MARKDOWN)
+    if not await check_auth(update): return
+    status = "AWS (2GB)" if API_MODE == 'local' else "Render (50MB)"
+    await update.message.reply_text(f"👋 **Personal Bot Active!**\nServer Mode: **{status}**\n\nLink bhejo video nikalne ke liye.", parse_mode=ParseMode.MARKDOWN)
+
+async def stop_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_auth(update): return
+    global IS_STOPPED
+    IS_STOPPED = True
+    await update.message.reply_text("🛑 **Bot Stopping...**\nSabhi process rok diye gaye hain.\n(Restart ke liye deploy dobara karein)")
+    # Force kill python process to stop heavy downloads
+    os._exit(0)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    update_id = update.update_id
-    if update_id in PROCESSING_QUEUE:
-        return
-    PROCESSING_QUEUE.add(update_id)
+    if IS_STOPPED: return
+    if not await check_auth(update): return
+    
+    url = update.message.text.strip()
+    if "http" not in url: return
 
-    try:
-        url = update.message.text.strip()
-        if "http" not in url:
-            return
-        
-        if not await check_subscription(user_id, context.bot):
-            await update.message.reply_text(f"🚫 Join {REQUIRED_CHANNEL} first.")
-            return
-
-        _, user_data = get_user_data(user_id)
-        if not user_data["premium"] and user_data["count"] >= DAILY_LIMIT:
-            await update.message.reply_text("🚫 Daily Limit Reached.")
-            return
-
-        if "youtube.com" in url or "youtu.be" in url:
-            context.user_data['current_url'] = url
-            keyboard = [[InlineKeyboardButton("🎵 MP3", callback_data="audio"), InlineKeyboardButton("🎬 360p", callback_data="360")],
-                        [InlineKeyboardButton("🎬 720p", callback_data="720"), InlineKeyboardButton("💎 Best", callback_data="best")]]
-            await update.message.reply_text("⚙️ **Quality:**", reply_markup=InlineKeyboardMarkup(keyboard))
-        else:
-            wait_msg = await update.message.reply_text("⏳ **Processing...**", parse_mode=ParseMode.MARKDOWN)
-            await process_download(update, context, url, 'best', wait_msg, user_id)
-
-    except Exception as e:
-        logger.error(f"Handler Error: {e}")
-    finally:
-        if update_id in PROCESSING_QUEUE:
-            PROCESSING_QUEUE.remove(update_id)
+    context.user_data['url'] = url
+    
+    # Quality Keyboard
+    keyboard = [
+        [InlineKeyboardButton("🎵 Audio (MP3)", callback_data="audio")],
+        [InlineKeyboardButton("360p", callback_data="360"), InlineKeyboardButton("720p", callback_data="720")],
+        [InlineKeyboardButton("1080p (FHD)", callback_data="1080"), InlineKeyboardButton("🔥 Best (1GB+)", callback_data="best")]
+    ]
+    await update.message.reply_text("⚙️ **Quality Select Karein:**", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if IS_STOPPED: return
     query = update.callback_query
     await query.answer()
-    url = context.user_data.get('current_url')
-    if not url:
-        await query.edit_message_text("❌ Link expired.")
-        return
-    wait_msg = await query.edit_message_text(f"⏳ **Downloading {query.data.upper()}...**")
-    await process_download(update, context, url, query.data, wait_msg, query.from_user.id)
+    
+    quality = query.data
+    url = context.user_data.get('url')
+    
+    status_msg = await query.edit_message_text(f"⏳ **Downloading {quality.upper()}...**\n(Ye process lamba chal sakta hai)")
 
-async def process_download(update, context, url, quality, wait_msg, user_id):
-    file_path = None
-    try:
-        file_path, title, duration, width, height, error_msg = download_media(url, quality)
+    # Run Download
+    # Note: Badi files ke liye ye blocking ho sakta hai, par personal bot ke liye theek hai
+    path, title, duration, w, h = download_video(url, quality)
+
+    if path and os.path.exists(path):
+        file_size = os.path.getsize(path)
         
-        if file_path and os.path.exists(file_path):
-            file_size = os.path.getsize(file_path)
-            if file_size > MAX_FILE_SIZE:
-                await wait_msg.edit_text(f"❌ File too big ({round(file_size/(1024*1024))}MB). Limit 50MB.")
-                os.remove(file_path)
-                return
+        # Limit Check
+        if file_size > MAX_FILE_SIZE:
+            await status_msg.edit_text(f"❌ **File Too Big!**\nSize: {round(file_size/(1024*1024))}MB\nAllowed: {round(MAX_FILE_SIZE/(1024*1024))}MB\n\n(AWS Local Server Setup karein 1GB+ ke liye)")
+            os.remove(path)
+            return
 
-            await wait_msg.edit_text("📤 **Uploading...**")
-            with open(file_path, 'rb') as f:
-                if quality == 'audio':
-                    await context.bot.send_audio(chat_id=user_id, audio=f, title=title)
-                else:
-                    await context.bot.send_video(
-                        chat_id=user_id, 
-                        video=f, 
-                        caption=title, 
-                        supports_streaming=True, 
-                        width=width, 
-                        height=height, 
-                        duration=duration, 
-                        read_timeout=120, 
-                        write_timeout=120
-                    )
-            increment_download(user_id)
-            await wait_msg.delete()
-        else:
-            clean_error = str(error_msg).replace(os.getcwd(), "")[-300:]
-            await wait_msg.edit_text(f"❌ **Failed.**\n\nLog: `{clean_error}`", parse_mode=ParseMode.MARKDOWN)
-            
-    except Exception as e:
-        logger.error(f"Process Error: {e}")
+        await status_msg.edit_text("📤 **Uploading to Telegram...**")
+        
         try:
-            await wait_msg.edit_text("❌ Internal Bot Error.")
-        except:
-            pass
-    finally:
-        if file_path and os.path.exists(file_path): 
-            try:
-                os.remove(file_path)
-            except:
-                pass
+            with open(path, 'rb') as f:
+                if quality == 'audio':
+                    await context.bot.send_audio(chat_id=OWNER_ID, audio=f, title=title, caption="Downloaded via Bot", read_timeout=1200, write_timeout=1200)
+                else:
+                    await context.bot.send_video(chat_id=OWNER_ID, video=f, caption=title, supports_streaming=True, width=w, height=h, duration=duration, read_timeout=1200, write_timeout=1200)
+            
+            await status_msg.delete()
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Upload Error: {e}")
+        finally:
+            if os.path.exists(path): os.remove(path)
+    else:
+        await status_msg.edit_text("❌ Download Failed.")
 
-# --- SETUP ---
+# --- INITIALIZATION ---
+# Request Timeout badhana zaroori hai badi files ke liye
+request = HTTPXRequest(connection_pool_size=8, read_timeout=1200, write_timeout=1200)
+
+if BASE_URL:
+    # AWS Local Server Mode
+    ptb_application = Application.builder().token(BOT_TOKEN).base_url(BASE_URL).request(request).build()
+else:
+    # Render Standard Mode
+    ptb_application = Application.builder().token(BOT_TOKEN).request(request).build()
+
+# Handlers
 ptb_application.add_handler(CommandHandler("start", start))
+ptb_application.add_handler(CommandHandler("stop", stop_bot))
 ptb_application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 ptb_application.add_handler(CallbackQueryHandler(button_handler))
 
 async def setup_bot():
     await ptb_application.initialize()
-    url = f"{WEBHOOK_URL}/webhook"
-    if (await ptb_application.bot.get_webhook_info()).url != url:
-        await ptb_application.bot.set_webhook(url=url)
+    # Webhook Setup (Dono environments ke liye)
+    if WEBHOOK_URL:
+        await ptb_application.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
+    
+    logger.info("✅ Bot Started Successfully")
 
 @app.route('/webhook', methods=['POST'])
 def webhook_handler():
     if request.method == "POST":
         data = request.get_json(force=True)
         update = Update.de_json(data, ptb_application.bot)
-        if update.update_id in PROCESSING_QUEUE:
-            return "OK"
         asyncio.run(ptb_application.process_update(update))
         return "OK"
     return "Invalid"
@@ -375,5 +229,4 @@ else:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(setup_bot())
-    except:
-        pass
+    except: pass
