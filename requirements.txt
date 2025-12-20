@@ -4,3 +4,5 @@ yt-dlp
 ujson
 requests
 gunicorn
+beautifulsoup4
+lxml
