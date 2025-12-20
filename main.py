@@ -26,22 +26,15 @@ except:
 COOKIES_ENV = os.getenv("COOKIES_CONTENT")
 API_MODE = os.getenv("API_MODE", "standard")
 
+# --- WEBSITE CONFIGURATION (New Feature) ---
+# Environment variable 'WEBSITE_URL' se link uthayega. 
+# Agar set nahi hai to default use karega.
+TARGET_DOMAIN = os.getenv("WEBSITE_URL", "https://hdhub4u.rehab").rstrip("/")
+
 # --- SETTINGS ---
 DOWNLOAD_DIR = "downloads"
 DATA_FILE = "users.json"
 COOKIE_FILE = "cookies.txt"
-# Target Website from your L1.txt
-TARGET_DOMAIN = "https://hdhub4u.rehab"
-
-# Limits
-if API_MODE == 'local':
-    BASE_URL = "http://localhost:8081/bot"
-    MAX_FILE_SIZE = 1950 * 1024 * 1024
-    SERVER_TAG = "🚀 Local Server (2GB)"
-else:
-    BASE_URL = None
-    MAX_FILE_SIZE = 49 * 1024 * 1024
-    SERVER_TAG = "☁️ Cloud Server (50MB)"
 
 # Logging
 logging.basicConfig(
@@ -70,12 +63,18 @@ AUTHORIZED_USERS = load_users()
 
 # --- COOKIE SETUP ---
 def setup_cookies():
-    if COOKIES_ENV:
-        with open(COOKIE_FILE, 'w') as f:
-            f.write("# Netscape HTTP Cookie File\n")
-            for line in COOKIES_ENV.split('\n'):
-                if len(line.strip()) > 10 and not line.startswith('#'):
-                    f.write(line + "\n")
+    # YT-DLP ke liye file banayenge
+    valid_lines = ["# Netscape HTTP Cookie File"]
+    if COOKIES_ENV and len(COOKIES_ENV) > 10:
+        lines = COOKIES_ENV.split('\n')
+        for line in lines:
+            parts = line.strip().split()
+            if len(parts) >= 7 and not line.startswith('#'):
+                valid_lines.append("\t".join(parts))
+    
+    with open(COOKIE_FILE, 'w') as f:
+        f.write("\n".join(valid_lines))
+        f.write("\n")
 
 setup_cookies()
 
@@ -92,125 +91,183 @@ async def check_auth(update: Update):
         return False
     return True
 
-# --- CUSTOM HDHUB4U SCRAPER ---
+# --- ADVANCED SCRAPER ENGINE ---
 
-def search_hdhub(query):
-    """
-    Searches HDHub4u for the movie using requests & bs4.
-    """
-    search_url = f"{TARGET_DOMAIN}/?s={query}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+def get_headers():
+    """Real Browser Headers to bypass blocking"""
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Referer": TARGET_DOMAIN,
+        "Upgrade-Insecure-Requests": "1"
     }
+
+def get_request_cookies():
+    """
+    Parses cookies.txt to dictionary for 'requests' library.
+    This helps bypass Cloudflare if you have fresh cookies.
+    """
+    cookies = {}
+    if os.path.exists(COOKIE_FILE):
+        try:
+            with open(COOKIE_FILE, 'r') as f:
+                for line in f:
+                    if not line.startswith("#") and len(line.strip()) > 0:
+                        parts = line.strip().split('\t')
+                        if len(parts) >= 7:
+                            cookies[parts[5]] = parts[6]
+        except: pass
+    return cookies
+
+def search_website(query):
+    """
+    Searches the website using the query.
+    Handles 'No Results' by checking status code and HTML structure.
+    """
+    search_url = f"{TARGET_DOMAIN}/?s={query.replace(' ', '+')}"
+    logger.info(f"Searching: {search_url}")
     
     try:
-        resp = requests.get(search_url, headers=headers, timeout=15)
+        session = requests.Session()
+        session.headers.update(get_headers())
+        session.cookies.update(get_request_cookies())
+        
+        resp = session.get(search_url, timeout=15)
+        
+        if resp.status_code != 200:
+            logger.error(f"Website Blocked Bot. Status Code: {resp.status_code}")
+            return {"error": f"Website Blocked (Status {resp.status_code}). Update Cookies."}
+            
         soup = BeautifulSoup(resp.text, 'lxml')
-        
         results = []
-        # Finding posts in the search result page
-        # Usually they are in <article> tags or look for links with class "thumb" or similar
-        # Fallback: Find all 'a' tags inside main content area that look like movie links
         
-        # Taking a generic approach for WordPress themes (which HDHub uses)
-        # Looking for article headers or thumbnails
-        for article in soup.find_all('article'):
-            link_tag = article.find('a')
-            if link_tag and link_tag.get('href'):
-                title = link_tag.get('title') or link_tag.text.strip()
-                url = link_tag.get('href')
-                if title and url:
+        # Generic WordPress Structure Parser
+        # Strategies to find movie posts:
+        # 1. Look for <article> tags
+        # 2. Look for divs with class 'post', 'result', 'thumb'
+        
+        candidates = soup.find_all('article')
+        if not candidates:
+            candidates = soup.select('div.post, div.result-item, div.latestPost, div.post-item')
+            
+        for item in candidates:
+            # Find Link and Title
+            a_tag = item.find('a')
+            img_tag = item.find('img')
+            
+            if a_tag and a_tag.get('href'):
+                url = a_tag['href']
+                title = a_tag.get('title')
+                
+                # If title not in a_tag, check inside or img alt
+                if not title:
+                    title = a_tag.text.strip()
+                if not title and img_tag:
+                    title = img_tag.get('alt')
+                
+                if title and url and "http" in url:
+                    # Clean title
+                    title = title.replace("Download", "").replace("Watch", "").strip()
                     results.append({"title": title, "url": url})
-                    if len(results) >= 5: break
-        
-        # If articles not found (some themes use div based grid)
+                    if len(results) >= 8: break # Limit results
+
         if not results:
-            for item in soup.select('div.post-item, div.result-item, div.latestPost'):
-                link_tag = item.find('a')
-                if link_tag:
-                    results.append({
-                        "title": link_tag.get('title', 'Movie Result'),
-                        "url": link_tag['href']
-                    })
-                    if len(results) >= 5: break
-
+            # Debugging: Check if we got a Captcha page
+            if "Cloudflare" in resp.text or "captcha" in resp.text.lower():
+                return {"error": "Cloudflare/Captcha Blocked. Cookies Expired."}
+            return []
+            
         return results
-    except Exception as e:
-        logger.error(f"Search Error: {e}")
-        return []
 
-def extract_links_from_page(url):
+    except Exception as e:
+        logger.error(f"Search Failed: {e}")
+        return {"error": str(e)}
+
+def extract_links(url):
     """
-    Extracts download links from a specific movie page based on L1.txt structure.
+    Extracts download links from the movie page (Based on L1.txt structure)
     """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
-    }
+    logger.info(f"Extracting links from: {url}")
     try:
-        resp = requests.get(url, headers=headers, timeout=15)
+        session = requests.Session()
+        session.headers.update(get_headers())
+        session.cookies.update(get_request_cookies())
+        
+        resp = session.get(url, timeout=15)
         soup = BeautifulSoup(resp.text, 'lxml')
         
         links = []
         
-        # Based on L1.txt, links are often inside <h3> or <h4> tags
-        # Example: <h3><a href="...">480p...</a></h3>
+        # Based on L1.txt: Links are often in <h3> or <h4> or simple <a> tags
+        # We look for specific keywords in the link TEXT or CLASS
+        keywords = ['480p', '720p', '1080p', '2160p', '4k', 'Download']
         
-        # Find all 'a' tags that might be download links
-        # We look for keywords like '480p', '720p', '1080p', 'Download' in the text
-        keywords = ['480p', '720p', '1080p', '2160p', '4k', 'download']
+        # Strategy: Find all links that look like download links
+        all_links = soup.find_all('a', href=True)
         
-        for a_tag in soup.find_all('a', href=True):
-            text = a_tag.text.strip()
-            href = a_tag['href']
+        for a in all_links:
+            text = a.get_text(strip=True)
+            href = a['href']
             
-            # Filter logic: Check if text contains quality info
-            if any(k in text.lower() for k in keywords) and "http" in href:
-                # Clean up the text
-                clean_text = text.replace('⚡', '').replace('Download', '').strip()
+            # Simple Filter: If text has quality info
+            is_valid = any(k.lower() in text.lower() for k in keywords)
+            
+            # Avoid category/tag links
+            if is_valid and "category" not in href and "tag" not in href:
+                # Clean text
+                clean_text = text.replace('⚡', '').replace('Download Links', '').strip()
                 if not clean_text: clean_text = "Download Link"
                 
-                # Check duplicates
+                # Deduplicate
                 if not any(l['url'] == href for l in links):
                     links.append({"quality": clean_text, "url": href})
-        
+
         return links
     except Exception as e:
-        logger.error(f"Extraction Error: {e}")
+        logger.error(f"Extraction Failed: {e}")
         return []
 
 # --- HANDLERS ---
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update): return
-    await update.message.reply_text(
-        f"👋 **HDHub4u Bot Ready!**\n\n"
-        f"🔎 **To Search:** `/search Movie Name`\n"
-        f"🔗 **Direct Link:** Send any video link to download."
+    
+    current_site = TARGET_DOMAIN.replace("https://", "")
+    txt = (
+        f"👋 **Bot Ready!**\n"
+        f"🌐 **Target Site:** `{current_site}`\n\n"
+        "🔎 **Search:** `/search Movie Name`\n"
+        "🔗 **Direct:** Send any URL to download."
     )
+    if update.effective_user.id == OWNER_ID: txt += "\n\n👮‍♂️ Admin: `/add`, `/remove`"
+    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update): return
     
     if not context.args:
-        await update.message.reply_text("❌ Usage: `/search Pathaan`")
+        await update.message.reply_text("❌ Usage: `/search Iron Man`")
         return
     
     query = " ".join(context.args)
-    await update.message.reply_text(f"🔍 Searching **HDHub4u** for: `{query}`...")
+    await update.message.reply_text(f"🔍 Searching on **{TARGET_DOMAIN}** for: `{query}`...")
     
     loop = asyncio.get_running_loop()
-    results = await loop.run_in_executor(executor, search_hdhub, query)
+    results = await loop.run_in_executor(executor, search_website, query)
     
+    if isinstance(results, dict) and "error" in results:
+        await update.message.reply_text(f"❌ **Error:** {results['error']}")
+        return
+
     if not results:
-        await update.message.reply_text("❌ No results found on HDHub4u.")
+        await update.message.reply_text("❌ **No results found.**\nTip: Try changing the website URL in ENV if domain changed.")
         return
     
-    # Store results in context to handle button clicks
-    context.user_data['movie_results'] = results
+    # Store results
+    context.user_data['search_res'] = results
     
     keyboard = []
     for idx, movie in enumerate(results):
-        # Using index as callback data to save space
         btn_text = f"🎬 {movie['title'][:30]}..."
         keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"sel_{idx}")])
         
@@ -224,72 +281,59 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     
-    # 1. User Selected a Movie
+    # 1. Movie Selected -> Fetch Links
     if data.startswith("sel_"):
         idx = int(data.split("_")[1])
-        results = context.user_data.get('movie_results', [])
+        results = context.user_data.get('search_res', [])
         
         if idx >= len(results):
-            await query.edit_message_text("❌ Session expired. Search again.")
+            await query.edit_message_text("❌ Session expired.")
             return
             
         movie = results[idx]
-        await query.edit_message_text(f"🔄 Fetching links for: **{movie['title']}**...")
+        await query.edit_message_text(f"🔄 **Extracting Links...**\nMovie: {movie['title']}")
         
-        # Scrape Links
         loop = asyncio.get_running_loop()
-        links = await loop.run_in_executor(executor, extract_links_from_page, movie['url'])
+        links = await loop.run_in_executor(executor, extract_links, movie['url'])
         
         if not links:
-            await query.edit_message_text("❌ No download links found on the page.")
+            await query.edit_message_text("❌ No download links found on page (Structure might have changed).")
             return
             
-        # Show Link Buttons
-        msg = f"🎬 **{movie['title']}**\n\n⬇️ **Download Links:**"
+        msg = f"🎬 **{movie['title']}**\n\n👇 **Click to Download:**"
         keyboard = []
         for link in links:
-            # We can't download direct files easily from these redirecting hosts (hubdrive etc)
-            # So we provide the Direct Link to user
-            btn_text = f"📥 {link['quality']}"
-            keyboard.append([InlineKeyboardButton(btn_text, url=link['url'])])
+            # We provide direct URL buttons
+            keyboard.append([InlineKeyboardButton(f"📥 {link['quality']}", url=link['url'])])
             
-        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
 
 # --- GENERIC DOWNLOADER (YouTube/Insta) ---
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update): return
     url = update.message.text.strip()
-    
     if "http" not in url: return
     
-    # Use yt-dlp for direct video links
-    await update.message.reply_text("⚡ Downloading Video...")
+    await update.message.reply_text("⚡ Using Generic Downloader...")
     
-    try:
-        def download_task():
-            if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
-            ts = int(time.time())
-            opts = {
-                'outtmpl': f'{DOWNLOAD_DIR}/vid_{ts}.%(ext)s',
-                'format': 'best',
-                'quiet': True,
-                'cookiefile': COOKIE_FILE if os.path.exists(COOKIE_FILE) else None
-            }
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                return ydl.prepare_filename(info)
+    def download_task():
+        if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
+        ts = int(time.time())
+        opts = {
+            'outtmpl': f'{DOWNLOAD_DIR}/vid_{ts}.%(ext)s',
+            'format': 'best',
+            'quiet': True,
+            'cookiefile': COOKIE_FILE if os.path.exists(COOKIE_FILE) else None
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            return ydl.prepare_filename(info)
 
+    try:
         loop = asyncio.get_running_loop()
         path = await loop.run_in_executor(executor, download_task)
-        
-        if os.path.getsize(path) > MAX_FILE_SIZE:
-            await update.message.reply_text("❌ File too large for Telegram upload.")
-            os.remove(path)
-            return
-            
-        await update.message.reply_video(video=open(path, 'rb'), caption="✅ Downloaded")
+        await update.message.reply_video(video=open(path, 'rb'), caption="✅ Done")
         os.remove(path)
-        
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)[:50]}")
 
@@ -300,6 +344,7 @@ async def main():
 
     app_bot.add_handler(CommandHandler("start", start))
     app_bot.add_handler(CommandHandler("search", search_command))
+    app_bot.add_handler(CommandHandler(["add", "remove"], admin_ops))
     app_bot.add_handler(CallbackQueryHandler(button_callback))
     app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     
