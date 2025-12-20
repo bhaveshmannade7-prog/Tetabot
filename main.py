@@ -5,7 +5,7 @@ import time
 import sys
 import ujson as json
 import requests
-import re
+import random
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -30,7 +30,6 @@ DOWNLOAD_DIR = "downloads"
 DATA_FILE = "users.json"
 COOKIE_FILE = "cookies.txt"
 
-# Limit Settings
 if API_MODE == 'local':
     BASE_URL = "http://localhost:8081/bot"
     MAX_FILE_SIZE = 1950 * 1024 * 1024  # 2GB
@@ -48,7 +47,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("BotEngine")
 
-# --- DATA MANAGEMENT ---
+# --- DATA & COOKIES ---
 def load_users():
     if not os.path.exists(DATA_FILE): return {OWNER_ID}
     try:
@@ -65,7 +64,6 @@ def save_users(users_set):
 
 AUTHORIZED_USERS = load_users()
 
-# --- COOKIE SETUP (YouTube Only) ---
 def setup_cookies():
     if not COOKIES_ENV or len(COOKIES_ENV) < 10: return
     try:
@@ -100,20 +98,22 @@ async def check_auth(update: Update):
         return False
     return True
 
-# --- TERABOX SPECIAL ENGINE ---
+# --- TERABOX ADVANCED ENGINE ---
+def get_random_agent():
+    agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
+    ]
+    return random.choice(agents)
+
 def resolve_terabox_url(url):
-    """
-    Advanced Redirect Follower for Short Links
-    """
+    """Deep Resolve to handle Redirect Wrappers"""
     session = requests.Session()
-    # Fake Browser Headers are CRITICAL here
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-    })
+    session.headers.update({"User-Agent": get_random_agent()})
     try:
-        resp = session.head(url, allow_redirects=True, timeout=10)
+        # Use GET instead of HEAD for better compatibility with JS redirects
+        resp = session.get(url, allow_redirects=True, timeout=10)
         return resp.url
     except:
         return url
@@ -124,78 +124,81 @@ def download_terabox(url):
         timestamp = int(time.time())
         filename = f"{DOWNLOAD_DIR}/terabox_{timestamp}.mp4"
         
-        # 1. Clean & Resolve URL
+        # 1. Resolve URL
         final_url = resolve_terabox_url(url)
-        
-        # URL Fix: terabox.app -> terabox.com (APIs often fail on .app)
-        if "terabox.app" in final_url:
-            final_url = final_url.replace("terabox.app", "terabox.com")
-            
-        logger.info(f"Processing Terabox: {final_url}")
+        logger.info(f"Target: {final_url}")
 
-        # 2. API Selection (New Working Endpoints)
-        # We try the most robust workers first
-        api_endpoints = [
+        # Link Cleaning: APIs often prefer 1024tera over terabox
+        if "terabox.app" in final_url: final_url = final_url.replace("terabox.app", "1024tera.com")
+        elif "terabox.com" in final_url: final_url = final_url.replace("terabox.com", "1024tera.com")
+
+        # 2. Multi-API Strategy (The "Nuclear" List)
+        # Using different workers increases success chance
+        api_list = [
             f"https://teraboxvideodownloader.nepcoderdevs.workers.dev/?url={final_url}",
             f"https://terabox-dl.qtcloud.workers.dev/api/get-download?url={final_url}",
+            f"https://video-downloader.vercel.app/api?url={final_url}", 
+            f"https://terabox.hnn.workers.dev/api/get-download?url={final_url}"
         ]
 
         direct_link = None
-        file_title = f"Terabox_{timestamp}.mp4"
-        
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
-        }
+        file_title = f"Terabox_Video_{timestamp}.mp4"
 
-        for api in api_endpoints:
+        for api in api_list:
             try:
-                logger.info(f"Hitting API: {api}")
-                r = requests.get(api, headers=headers, timeout=20)
+                # Spoof Referer to bypass API blocks
+                headers = {
+                    "User-Agent": get_random_agent(),
+                    "Referer": "https://www.google.com/",
+                    "Origin": "https://www.google.com/"
+                }
+                
+                logger.info(f"Trying API: {api}")
+                r = requests.get(api, headers=headers, timeout=15)
                 
                 if r.status_code != 200: continue
                 
-                try:
-                    data = r.json()
-                except: continue # Not JSON
+                try: data = r.json()
+                except: continue
 
-                # Extract Link Strategy
-                link_candidates = [
-                    data.get("response", {}).get("0", {}).get("resolutions", {}).get("Fast Download", ""), # NepCoder structure
-                    data.get("response", {}).get("0", {}).get("resolutions", {}).get("HD Video", ""),
-                    data.get("downloadLink"), # QTCloud structure
-                    data.get("url"),
-                    data.get("dlink")
-                ]
+                # Deep Search for Link in various JSON structures
+                candidates = []
                 
-                # Check valid link
-                for link in link_candidates:
+                # Structure 1 (NepCoder)
+                if "response" in data:
+                    res = data["response"]
+                    if isinstance(res, list) and len(res) > 0:
+                        candidates.append(res[0].get("resolutions", {}).get("Fast Download"))
+                        candidates.append(res[0].get("resolutions", {}).get("HD Video"))
+                        if "title" in res[0]: file_title = res[0]["title"]
+                
+                # Structure 2 (Standard)
+                candidates.append(data.get("downloadLink"))
+                candidates.append(data.get("url"))
+                candidates.append(data.get("dlink"))
+                
+                for link in candidates:
                     if link and link.startswith("http"):
                         direct_link = link
                         break
                 
-                # Extract Title
-                if "filename" in data: 
-                    file_title = data["filename"]
-                elif "response" in data:
-                    file_title = data.get("response", [{}])[0].get("title", file_title)
-
-                if direct_link: break # Found it
+                if direct_link: break # Success!
 
             except Exception as e:
-                logger.error(f"API Attempt Failed: {e}")
+                logger.error(f"API Fail: {e}")
+                continue
 
         if not direct_link:
-            return {"status": False, "error": "Terabox servers are blocking requests. Try again in 5 mins."}
+            return {"status": False, "error": "All Terabox Servers Busy. (Try updating cookies or wait)"}
 
-        # 3. Download Content
-        # Using Session to handle redirects/cookies passed by the API
-        with requests.Session() as s:
-            s.headers.update(headers)
-            r = s.get(direct_link, stream=True, timeout=30)
+        # 3. Download Stream
+        # IMPORTANT: Some Terabox links expire in seconds, so we stream immediately
+        headers_dl = {"User-Agent": get_random_agent()}
+        
+        with requests.get(direct_link, stream=True, headers=headers_dl, timeout=20) as r:
             r.raise_for_status()
-            
             with open(filename, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=1024*1024): # 1MB chunks
+                for chunk in r.iter_content(chunk_size=1024*1024):
                     if chunk: f.write(chunk)
                     
         return {
@@ -208,19 +211,19 @@ def download_terabox(url):
         }
 
     except Exception as e:
-        logger.error(f"TB Download Critical: {e}")
-        return {"status": False, "error": f"Failed: {str(e)[:50]}"}
+        logger.error(f"TB Critical: {e}")
+        return {"status": False, "error": "Download Failed (Link expired or private)"}
 
 # --- MAIN ENGINE ---
 def run_download_sync(url, quality):
     if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
     
-    # 1. Detect Terabox (All variants)
-    terabox_domains = ["terabox", "1024tera", "teraboxurl", "4funbox", "momerybox", "nephobox", "freeterabox"]
-    if any(domain in url for domain in terabox_domains):
+    # Detect Terabox
+    tb_domains = ["terabox", "1024tera", "teraboxurl", "4funbox", "momerybox", "nephobox", "freeterabox"]
+    if any(d in url for d in tb_domains):
         return download_terabox(url)
 
-    # 2. YT/Insta Logic (yt-dlp)
+    # Standard (YT/Insta)
     timestamp = int(time.time())
     is_yt = "youtube.com" in url or "youtu.be" in url
     
@@ -237,7 +240,7 @@ def run_download_sync(url, quality):
         'no_warnings': True,
         'geo_bypass': True,
         'nocheckcertificate': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+        'user_agent': get_random_agent(),
     }
     
     if is_yt and os.path.exists(COOKIE_FILE):
@@ -254,17 +257,11 @@ def run_download_sync(url, quality):
             filename = ydl.prepare_filename(info)
             base, _ = os.path.splitext(filename)
             final_path = base + (".mp3" if quality == 'audio' else ".mp4")
-            
-            if not os.path.exists(final_path) and os.path.exists(filename):
-                final_path = filename
+            if not os.path.exists(final_path) and os.path.exists(filename): final_path = filename
 
             return {
-                "status": True,
-                "path": final_path,
-                "title": info.get('title', 'Media'),
-                "duration": info.get('duration'),
-                "width": info.get('width'),
-                "height": info.get('height')
+                "status": True, "path": final_path, "title": info.get('title', 'Media'),
+                "duration": info.get('duration'), "width": info.get('width'), "height": info.get('height')
             }
     except Exception as e:
         return {"status": False, "error": str(e)}
@@ -273,9 +270,8 @@ def run_download_sync(url, quality):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update): return
     uid = update.effective_user.id
-    txt = f"👋 **Bot Active!**\nServer: {SERVER_TAG}\n\nSend links to download."
-    if uid == OWNER_ID:
-        txt += "\n\n👮‍♂️ **Admin Mode Enabled**"
+    txt = f"👋 **Bot Ready!**\nServer: {SERVER_TAG}\n\nSend links to download."
+    if uid == OWNER_ID: txt += "\n\n👮‍♂️ **Admin Mode**"
     await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
 
 async def admin_ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -283,16 +279,11 @@ async def admin_ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cmd = update.message.text.split()[0]
     try:
         target = int(context.args[0])
-        if cmd == "/add":
-            AUTHORIZED_USERS.add(target)
-            msg = "✅ Added"
+        if cmd == "/add": AUTHORIZED_USERS.add(target)
         elif cmd == "/remove":
-            if target != OWNER_ID: 
-                AUTHORIZED_USERS.discard(target)
-                msg = "🗑️ Removed"
-            else: msg = "❌ Cannot remove owner"
+            if target != OWNER_ID: AUTHORIZED_USERS.discard(target)
         save_users(AUTHORIZED_USERS)
-        await update.message.reply_text(msg)
+        await update.message.reply_text("✅ Done")
     except: await update.message.reply_text("Usage: /add <id>")
 
 async def show_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -305,20 +296,17 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not url.startswith("http"): return
 
     context.user_data['url'] = url
+    tb_domains = ["terabox", "1024tera", "teraboxurl", "4funbox"]
     
-    terabox_domains = ["terabox", "1024tera", "teraboxurl", "4funbox", "momerybox", "nephobox"]
-    
-    if any(d in url for d in terabox_domains):
-        keyboard = [[InlineKeyboardButton("⬇️ Download Terabox File", callback_data="terabox")]]
-        txt = "📦 **Terabox Detected!**\n(Using Advanced API)"
+    if any(d in url for d in tb_domains):
+        keyboard = [[InlineKeyboardButton("⬇️ Download Terabox", callback_data="terabox")]]
+        txt = "📦 **Terabox Link!**\n(Using Multi-API Retry System)"
     elif "youtube" in url or "youtu.be" in url:
-        keyboard = [
-            [InlineKeyboardButton("🎵 MP3", callback_data="audio")],
-            [InlineKeyboardButton("🎥 720p", callback_data="720"), InlineKeyboardButton("💎 Best", callback_data="best")]
-        ]
+        keyboard = [[InlineKeyboardButton("🎵 MP3", callback_data="audio")],
+                    [InlineKeyboardButton("720p", callback_data="720"), InlineKeyboardButton("Best", callback_data="best")]]
         txt = "📺 **YouTube Detected**"
     else:
-        keyboard = [[InlineKeyboardButton("⬇️ Download Media", callback_data="best")]]
+        keyboard = [[InlineKeyboardButton("⬇️ Download", callback_data="best")]]
         txt = "📸 **Link Detected**"
 
     await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
@@ -332,7 +320,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = context.user_data.get('url')
     quality = 'best' if data == 'terabox' else data
     
-    await query.edit_message_text(f"⚡ **Downloading...**\n⏳ Please wait...")
+    await query.edit_message_text(f"⚡ **Downloading...**\n(Trying multiple servers...)")
     
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(executor, run_download_sync, url, quality)
@@ -345,7 +333,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     size = os.path.getsize(path)
     
     if size > MAX_FILE_SIZE:
-        await query.edit_message_text(f"❌ File too big: {get_readable_size(size)}")
+        await query.edit_message_text(f"❌ Too Big: {get_readable_size(size)}")
         os.remove(path)
         return
 
@@ -354,18 +342,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with open(path, 'rb') as f:
             if quality == 'audio':
-                await context.bot.send_audio(
-                    chat_id=update.effective_chat.id, audio=f, title=result['title'],
-                    read_timeout=60, write_timeout=60, connect_timeout=30
-                )
+                await context.bot.send_audio(chat_id=update.effective_chat.id, audio=f, title=result['title'], read_timeout=60, write_timeout=60)
             else:
-                await context.bot.send_video(
-                    chat_id=update.effective_chat.id, video=f, caption=result['title'],
-                    supports_streaming=True, read_timeout=120, write_timeout=120, connect_timeout=30
-                )
+                await context.bot.send_video(chat_id=update.effective_chat.id, video=f, caption=result['title'], supports_streaming=True, read_timeout=120, write_timeout=120)
         await query.delete_message()
-    except Exception as e:
-        logger.error(f"Upload Error: {e}")
+    except Exception:
         await query.edit_message_text("❌ Upload Error.")
     finally:
         if os.path.exists(path): os.remove(path)
@@ -390,7 +371,6 @@ try:
 except RuntimeError:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-
 bot_app = loop.run_until_complete(main())
 
 @app.route('/webhook', methods=['POST'])
