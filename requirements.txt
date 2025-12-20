@@ -3,3 +3,4 @@ flask
 yt-dlp
 ujson
 requests
+gunicorn
