@@ -26,8 +26,8 @@ except:
 COOKIES_ENV = os.getenv("COOKIES_CONTENT")
 API_MODE = os.getenv("API_MODE", "standard")
 
-# --- WEBSITE URL CONFIG ---
-# Agar environment me WEBSITE_URL nahi hai, to default ye use karega
+# --- WEBSITE CONFIGURATION ---
+# Default website. ENV se change kar sakte hain.
 TARGET_DOMAIN = os.getenv("WEBSITE_URL", "https://hdhub4u.rehab").rstrip("/")
 
 # --- SETTINGS ---
@@ -35,13 +35,23 @@ DOWNLOAD_DIR = "downloads"
 DATA_FILE = "users.json"
 COOKIE_FILE = "cookies.txt"
 
+# Limit Settings
+if API_MODE == 'local':
+    BASE_URL = "http://localhost:8081/bot"
+    MAX_FILE_SIZE = 1950 * 1024 * 1024
+    SERVER_TAG = "🚀 Local Server (2GB)"
+else:
+    BASE_URL = None
+    MAX_FILE_SIZE = 49 * 1024 * 1024
+    SERVER_TAG = "☁️ Cloud Server (50MB)"
+
 # Logging
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("BotEngine")
+logger = logging.getLogger("SmartBot")
 
 # --- DATA ---
 def load_users():
@@ -77,7 +87,8 @@ def setup_cookies():
 setup_cookies()
 
 app = Flask(__name__)
-executor = ThreadPoolExecutor(max_workers=4)
+# Increased workers for parallel processing
+executor = ThreadPoolExecutor(max_workers=6)
 
 # --- UTILS ---
 async def check_auth(update: Update):
@@ -89,17 +100,24 @@ async def check_auth(update: Update):
         return False
     return True
 
-# --- SCRAPER ENGINE ---
+# --- SMART ENGINE (HUMAN MIMIC) ---
 
-def get_headers():
-    return {
+def get_headers(referer=None):
+    """Returns headers that look exactly like a real Chrome Browser"""
+    head = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Referer": TARGET_DOMAIN,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
     }
+    if referer:
+        head["Referer"] = referer
+    return head
 
 def get_cookies_dict():
-    """Convert cookies.txt to dict for requests"""
     cookies = {}
     if os.path.exists(COOKIE_FILE):
         try:
@@ -112,212 +130,311 @@ def get_cookies_dict():
         except: pass
     return cookies
 
-def search_website(query):
-    """
-    Parses the Homepage/Search Page based on 'New Text Document.txt' structure.
-    Target: <ul class="recent-movies"> -> <li class="thumb"> -> <a href> & <p>Title</p>
-    """
+# 1. SEARCH FUNCTION (Accurate)
+def search_website_smart(query):
     search_url = f"{TARGET_DOMAIN}/?s={query.replace(' ', '+')}"
-    logger.info(f"Searching: {search_url}")
+    logger.info(f"🔎 Smart Search: {search_url}")
     
     try:
         session = requests.Session()
-        session.headers.update(get_headers())
+        session.headers.update(get_headers(TARGET_DOMAIN))
         session.cookies.update(get_cookies_dict())
         
-        resp = session.get(search_url, timeout=20)
+        resp = session.get(search_url, timeout=15)
+        
+        # Check if we were redirected to home (Anti-bot behavior)
+        if resp.url.strip('/') == TARGET_DOMAIN.strip('/'):
+            logger.warning("Search redirected to Homepage (Anti-Bot Triggered)")
+            return []
+
         soup = BeautifulSoup(resp.text, 'lxml')
         results = []
         
-        # Logic based on your uploaded file:
-        # Find the list with class "recent-movies"
-        movie_list = soup.find('ul', class_='recent-movies')
+        # Strict parsing: Only look for search results, not recent posts
+        # Usually inside a specific container for search results
+        # We look for 'li' with class 'thumb' inside 'ul'
         
-        if movie_list:
-            # Find all list items with class "thumb"
-            items = movie_list.find_all('li', class_='thumb')
-            for item in items:
-                # Link is in the <figure> -> <a> or <figcaption> -> <a>
-                link_tag = item.find('a')
-                if not link_tag: continue
+        # Attempt 1: Standard Structure
+        items = soup.select('ul.recent-movies li.thumb')
+        if not items:
+            # Attempt 2: Article structure
+            items = soup.select('article.post')
+            
+        for item in items:
+            link_tag = item.find('a')
+            if not link_tag: continue
+            
+            url = link_tag.get('href')
+            
+            # Smart Title Extraction
+            # Try figcaption > p
+            caption = item.find('figcaption')
+            if caption and caption.find('p'):
+                title = caption.find('p').text.strip()
+            # Try img alt
+            elif item.find('img') and item.find('img').get('alt'):
+                title = item.find('img').get('alt')
+            # Try link title attribute
+            elif link_tag.get('title'):
+                title = link_tag.get('title')
+            else:
+                title = link_tag.text.strip()
                 
-                url = link_tag.get('href')
-                
-                # Title is usually in <figcaption> -> <p>
-                caption = item.find('figcaption')
-                if caption:
-                    p_tag = caption.find('p')
-                    title = p_tag.text.strip() if p_tag else caption.text.strip()
-                else:
-                    # Fallback to img alt
-                    img = item.find('img')
-                    title = img.get('alt') if img else "Unknown Movie"
-                
-                if url and title:
-                    # Clean title
-                    title = title.replace("Download", "").strip()
-                    results.append({"title": title, "url": url})
-                    if len(results) >= 8: break
+            if url and title:
+                # Clean Title
+                title = title.replace("Download", "").replace("Full Movie", "").strip()
+                results.append({"title": title, "url": url})
+                if len(results) >= 8: break
         
-        # Fallback if specific structure changes (Backup Plan)
-        if not results:
-            for article in soup.find_all('article'):
-                a = article.find('a')
-                if a and a.get('href'):
-                    results.append({"title": a.text.strip(), "url": a['href']})
-
         return results
 
     except Exception as e:
         logger.error(f"Search Error: {e}")
         return []
 
-def extract_links(url):
-    """
-    Extracts download links from the Movie Page.
-    Targets keywords like 480p, 720p, 1080p in <a> tags.
-    """
+# 2. MOVIE PAGE PARSER (Find Quality Buttons)
+def extract_quality_options(url):
+    logger.info(f"📂 Parsing Movie Page: {url}")
     try:
         session = requests.Session()
-        session.headers.update(get_headers())
+        session.headers.update(get_headers(TARGET_DOMAIN))
         session.cookies.update(get_cookies_dict())
         
         resp = session.get(url, timeout=20)
         soup = BeautifulSoup(resp.text, 'lxml')
-        links = []
+        options = []
         
-        # Keywords to identify download buttons
-        keywords = ['480p', '720p', '1080p', '2160p', '4k', 'Download']
+        # Smart Regex to find quality links
+        # Matches: "Download 720p", "1080p Link", "480p", "Telegram"
+        quality_patterns = re.compile(r'(480p|720p|1080p|2160p|4k|hevc|telegram|g-drive|watch online)', re.IGNORECASE)
         
-        # Find all links
-        for a in soup.find_all('a', href=True):
-            text = a.get_text(strip=True)
+        # Scan all links in the main content area (usually entry-content)
+        content_div = soup.find('div', class_='entry-content')
+        if not content_div: content_div = soup # Fallback to full page
+        
+        all_links = content_div.find_all('a', href=True)
+        
+        for a in all_links:
+            text = a.get_text(" ", strip=True)
             href = a['href']
             
-            # Filter valid links
-            if any(k.lower() in text.lower() for k in keywords) and "http" in href:
-                # Clean text to make it look good on button
-                clean_text = text.replace('⚡', '').replace('Download Links', '').replace('Download', '').strip()
-                if not clean_text: clean_text = "Download Link"
+            # Skip internal junk links
+            if "wp-login" in href or "#" in href or "javascript" in href: continue
+            
+            # Check if link text matches a quality pattern
+            if quality_patterns.search(text) or "Download" in text:
                 
-                # Avoid duplicates
-                if not any(l['url'] == href for l in links):
-                    links.append({"quality": clean_text, "url": href})
-        
-        return links
+                # Assign an Icon based on type
+                icon = "📥"
+                if "720" in text: icon = "🎥"
+                elif "1080" in text: icon = "💎"
+                elif "480" in text: icon = "📱"
+                elif "Telegram" in text or "t.me" in href: icon = "✈️"
+                elif "Watch" in text: icon = "▶️"
+                
+                # Clean Label
+                label = f"{icon} {text.replace('Download', '').replace('Links', '').strip()[:25]}"
+                if len(label) < 4: label = f"{icon} Download Link"
+                
+                # Deduplicate
+                if not any(o['url'] == href for o in options):
+                    options.append({"label": label, "url": href})
+
+        return options
     except Exception as e:
-        logger.error(f"Extraction Error: {e}")
+        logger.error(f"Page Parse Error: {e}")
         return []
 
-# --- ADMIN HANDLER (Defined before usage) ---
-async def admin_ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID: return
+# 3. DEEP LINK EXTRACTOR (The "Human Click" Logic)
+def resolve_landing_page(url):
+    """
+    Visits the intermediate download page to find the REAL link.
+    """
+    logger.info(f"🕵️ Deep resolving: {url}")
+    
+    # Check if it's already a Telegram link
+    if "t.me" in url:
+        return {"type": "telegram", "url": url}
+    
     try:
-        if not context.args:
-            await update.message.reply_text("Usage: `/add 123456`")
-            return
-            
-        cmd = update.message.text.split()[0]
-        target = int(context.args[0])
+        session = requests.Session()
+        session.headers.update(get_headers(TARGET_DOMAIN))
+        session.cookies.update(get_cookies_dict())
         
-        if cmd == "/add": 
-            AUTHORIZED_USERS.add(target)
-            msg = "✅ User Added"
-        elif cmd == "/remove": 
-            if target != OWNER_ID: 
-                AUTHORIZED_USERS.discard(target)
-                msg = "🗑️ User Removed"
-            else:
-                msg = "❌ Cannot remove Owner"
-                
-        save_users(AUTHORIZED_USERS)
-        await update.message.reply_text(msg)
+        # Follow redirects (upto a limit)
+        resp = session.get(url, timeout=20, allow_redirects=True)
+        
+        # Final URL check
+        if "t.me" in resp.url:
+            return {"type": "telegram", "url": resp.url}
+            
+        soup = BeautifulSoup(resp.text, 'lxml')
+        
+        # LOGIC: Find the "Click to Verify" or "Fast Download" button
+        # Common classes on these sites: .btn, .button, or links inside .code-block
+        
+        # Priority 1: Look for "HubCloud" or "Drive" links in the new page
+        target_links = []
+        for a in soup.find_all('a', href=True):
+            h = a['href']
+            t = a.text.lower()
+            if any(x in h for x in ['hubcloud', 'gdfluen', 'drive', 'hubdrive', 'file']):
+                target_links.append(h)
+            elif "verify" in t or "click here" in t or "unlock" in t:
+                target_links.append(h)
+        
+        if target_links:
+            # Return the first valid looking link
+            return {"type": "link", "url": target_links[0]}
+            
+        # If no deeper link found, return the current URL (User can handle it)
+        return {"type": "link", "url": resp.url}
+
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
+        return {"type": "error", "error": str(e)}
 
 # --- HANDLERS ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update): return
-    site_name = TARGET_DOMAIN.replace("https://", "").replace("http://", "")
-    
     txt = (
-        f"👋 **Bot Ready!**\n"
-        f"🌐 **Site:** `{site_name}`\n\n"
-        "🔎 `/search MovieName`\n"
-        "🔗 Send Link to Download"
+        f"👋 **Smart Bot Active!**\n"
+        f"🌐 Site: `{TARGET_DOMAIN}`\n\n"
+        "🤖 **Features:**\n"
+        "1. **Smart Search:** `/search MovieName`\n"
+        "2. **Deep Extraction:** I click buttons like a human!\n"
+        "3. **Telegram Finder:** I prioritize Telegram links."
     )
     if update.effective_user.id == OWNER_ID: txt += "\n\n👮‍♂️ Admin: `/add`, `/remove`"
     await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
 
+async def admin_ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID: return
+    try:
+        cmd, target = update.message.text.split()
+        target = int(target)
+        if cmd == "/add": AUTHORIZED_USERS.add(target)
+        elif cmd == "/remove": AUTHORIZED_USERS.discard(target)
+        save_users(AUTHORIZED_USERS)
+        await update.message.reply_text("✅ Done")
+    except: await update.message.reply_text("Usage: `/add 12345`")
+
+# --- SEARCH HANDLER ---
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update): return
     if not context.args:
-        await update.message.reply_text("❌ Usage: `/search Pushpa`")
+        await update.message.reply_text("❌ Usage: `/search Kalki`")
         return
     
     query = " ".join(context.args)
-    await update.message.reply_text(f"🔍 Searching: `{query}`...")
+    await update.message.reply_text(f"🔍 **Smart Search:** `{query}`...")
     
     loop = asyncio.get_running_loop()
-    results = await loop.run_in_executor(executor, search_website, query)
+    results = await loop.run_in_executor(executor, search_website_smart, query)
     
     if not results:
-        await update.message.reply_text(f"❌ No results found on **{TARGET_DOMAIN}**.\n(Check website URL or Cookies)")
+        await update.message.reply_text(f"❌ No results for `{query}`.\n(Try checking spelling or Cookies)")
         return
     
     context.user_data['search_res'] = results
+    
     keyboard = []
     for idx, movie in enumerate(results):
-        # Truncate title if too long
-        title = movie['title'][:40] + "..." if len(movie['title']) > 40 else movie['title']
-        keyboard.append([InlineKeyboardButton(f"🎬 {title}", callback_data=f"sel_{idx}")])
+        # Callback: s_{index} (s for selection)
+        keyboard.append([InlineKeyboardButton(f"🎬 {movie['title']}", callback_data=f"s_{idx}")])
         
     await update.message.reply_text(f"✅ Found {len(results)} movies:", reply_markup=InlineKeyboardMarkup(keyboard))
 
+# --- BUTTON HANDLER ---
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
     
-    if data.startswith("sel_"):
+    # 1. MOVIE SELECTED -> SHOW QUALITY OPTIONS
+    if data.startswith("s_"):
         idx = int(data.split("_")[1])
         results = context.user_data.get('search_res', [])
         if idx >= len(results): 
-            await query.edit_message_text("❌ Session expired.")
+            await query.edit_message_text("❌ Session expired. Search again.")
             return
             
         movie = results[idx]
-        await query.edit_message_text(f"🔄 Parsing links for:\n**{movie['title']}**...")
+        # Store selected movie url
+        context.user_data['selected_movie_url'] = movie['url']
+        
+        await query.edit_message_text(f"📂 **Parsing Movie Page...**\n`{movie['title']}`\n\n(Finding all Blue Links...)")
         
         loop = asyncio.get_running_loop()
-        links = await loop.run_in_executor(executor, extract_links, movie['url'])
+        quality_options = await loop.run_in_executor(executor, extract_quality_options, movie['url'])
         
-        if not links:
-            await query.edit_message_text("❌ No download links found on page.")
+        if not quality_options:
+            await query.edit_message_text("❌ Bot couldn't find download buttons.\n(Page structure might be complex)")
+            return
+        
+        # Save options to context so we can resolve them later
+        context.user_data['quality_opts'] = quality_options
+        
+        keyboard = []
+        for i, opt in enumerate(quality_options):
+            # Callback: l_{index} (l for link resolution)
+            keyboard.append([InlineKeyboardButton(opt['label'], callback_data=f"l_{i}")])
+            
+        await query.edit_message_text(f"🎬 **{movie['title']}**\n👇 Select Quality to Fetch Link:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # 2. QUALITY SELECTED -> DEEP RESOLVE (The "Human Click")
+    if data.startswith("l_"):
+        idx = int(data.split("_")[1])
+        opts = context.user_data.get('quality_opts', [])
+        if idx >= len(opts): return
+        
+        target_opt = opts[idx]
+        await query.edit_message_text(f"🕵️ **Deep Extracting...**\nOpening: {target_opt['label']}\n\n(Please wait, visiting link...)")
+        
+        loop = asyncio.get_running_loop()
+        final_result = await loop.run_in_executor(executor, resolve_landing_page, target_opt['url'])
+        
+        if final_result.get("type") == "error":
+            await query.edit_message_text(f"❌ Failed to extract: {final_result.get('error')}")
             return
             
-        keyboard = []
-        for link in links:
-            keyboard.append([InlineKeyboardButton(f"📥 {link['quality']}", url=link['url'])])
+        final_url = final_result.get("url")
+        
+        # Display the result
+        if "t.me" in final_url:
+            msg = f"✈️ **Telegram Link Found!**\n\n🔗 [Join Channel / Download]({final_url})"
+            kb = [[InlineKeyboardButton("✈️ Open Telegram", url=final_url)]]
+        else:
+            msg = f"✅ **Download Link Extracted!**\n\nOriginal: {target_opt['label']}\n\n🔗 **Link:** `{final_url}`"
+            kb = [[InlineKeyboardButton("⬇️ Download Now", url=final_url)]]
             
-        await query.edit_message_text(f"🎬 **{movie['title']}**\n\n👇 Click to Download:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        # Give option to go back
+        kb.append([InlineKeyboardButton("🔙 Back to Qualities", callback_data="back_to_qual")])
+        
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+        return
 
+    # 3. BACK BUTTON
+    if data == "back_to_qual":
+        opts = context.user_data.get('quality_opts', [])
+        keyboard = []
+        for i, opt in enumerate(opts):
+            keyboard.append([InlineKeyboardButton(opt['label'], callback_data=f"l_{i}")])
+        await query.edit_message_text("👇 Select Quality:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+# --- GENERIC DOWNLOADER (YouTube/Insta) ---
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update): return
     url = update.message.text.strip()
     if "http" not in url: return
     
-    await update.message.reply_text("⚡ Processing URL...")
+    await update.message.reply_text("⚡ Processing URL (Generic)...")
     
     def dl_task():
         if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
-        opts = {
-            'outtmpl': f'{DOWNLOAD_DIR}/vid_%(id)s.%(ext)s', 
-            'format': 'best', 
-            'quiet': True,
-            'cookiefile': COOKIE_FILE if os.path.exists(COOKIE_FILE) else None
-        }
+        opts = {'outtmpl': f'{DOWNLOAD_DIR}/vid_%(id)s.%(ext)s', 'format': 'best', 'quiet': True}
+        if os.path.exists(COOKIE_FILE): opts['cookiefile'] = COOKIE_FILE
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             return ydl.prepare_filename(info)
@@ -363,4 +480,3 @@ def webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-    
