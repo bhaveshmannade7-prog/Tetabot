@@ -11,7 +11,6 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
-from telegram.error import TimedOut, NetworkError
 import yt_dlp
 
 # --- CONFIGURATION ---
@@ -30,7 +29,7 @@ DOWNLOAD_DIR = "downloads"
 DATA_FILE = "users.json"
 COOKIE_FILE = "cookies.txt"
 
-# Limits
+# Limit Settings
 if API_MODE == 'local':
     BASE_URL = "http://localhost:8081/bot"
     MAX_FILE_SIZE = 1950 * 1024 * 1024  # 2GB
@@ -100,35 +99,52 @@ async def check_auth(update: Update):
         return False
     return True
 
-# --- TERABOX ENGINE ---
+# --- TERABOX ADVANCED ENGINE ---
+def resolve_terabox_url(url):
+    """
+    Short URL (teraboxurl.com) ko Full URL (terabox.com) me convert karta hai.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    try:
+        # Allow redirects to find the final landing page
+        response = requests.head(url, allow_redirects=True, headers=headers, timeout=10)
+        return response.url
+    except Exception as e:
+        logger.error(f"URL Resolve Error: {e}")
+        return url
+
 def download_terabox(url):
-    """
-    Terabox specific downloader using requests (Bypasses yt-dlp)
-    """
     try:
         if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
         timestamp = int(time.time())
         filename = f"{DOWNLOAD_DIR}/terabox_{timestamp}.mp4"
         
-        # Free API to resolve Terabox links (Public Service)
-        # Note: This uses a third-party API wrapper since Terabox requires complex auth
-        api_url = f"https://terabox-dl.qtcloud.workers.dev/api/get-download?url={url}"
+        # Step 1: Resolve Short Links (Critical Fix)
+        final_url = resolve_terabox_url(url)
+        logger.info(f"Resolved URL: {final_url}")
+
+        # Step 2: Try Primary API
+        # Using a public worker that handles redirects better
+        api_url = f"https://terabox-dl.qtcloud.workers.dev/api/get-download?url={final_url}"
         
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
         
-        # Step 1: Get Direct Link
-        resp = requests.get(api_url, headers=headers, timeout=15)
+        resp = requests.get(api_url, headers=headers, timeout=20)
         data = resp.json()
         
+        # Validation
         if "downloadLink" not in data:
-            return {"status": False, "error": "Terabox API Failed (Link Expired or Private)"}
+            logger.error(f"Terabox API Response: {data}")
+            return {"status": False, "error": "Link Expired or Server Busy"}
             
         direct_link = data["downloadLink"]
-        file_title = data.get("filename", "Terabox_Video.mp4")
+        file_title = data.get("filename", f"Terabox_{timestamp}.mp4")
         
-        # Step 2: Download Content
+        # Step 3: Download
         with requests.get(direct_link, stream=True, headers=headers) as r:
             r.raise_for_status()
             with open(filename, 'wb') as f:
@@ -139,24 +155,25 @@ def download_terabox(url):
             "status": True,
             "path": filename,
             "title": file_title,
-            "duration": 0, # Terabox doesn't give duration usually
+            "duration": 0,
             "width": 1280,
             "height": 720
         }
         
     except Exception as e:
         logger.error(f"Terabox Fail: {e}")
-        return {"status": False, "error": "Terabox Download Failed"}
+        return {"status": False, "error": f"Failed: {str(e)[:50]}"}
 
-# --- MAIN DOWNLOAD ENGINE ---
+# --- MAIN ENGINE ---
 def run_download_sync(url, quality):
     if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
     
-    # 1. Detect Terabox
-    if "terabox" in url or "1024tera" in url:
+    # 1. Detect Terabox (Expanded List)
+    terabox_domains = ["terabox", "1024tera", "teraboxurl", "4funbox", "momerybox"]
+    if any(domain in url for domain in terabox_domains):
         return download_terabox(url)
 
-    # 2. Standard yt-dlp (YouTube/Insta)
+    # 2. YT/Insta Logic
     timestamp = int(time.time())
     is_yt = "youtube.com" in url or "youtu.be" in url
     
@@ -164,7 +181,7 @@ def run_download_sync(url, quality):
         fmt = 'bestvideo+bestaudio/best' if quality == 'best' else f'bestvideo[height<={quality}]+bestaudio/best'
         if quality == 'audio': fmt = 'bestaudio/best'
     else:
-        fmt = 'best' # Insta/Facebook safe mode
+        fmt = 'best' # Insta Safe Mode
 
     opts = {
         'outtmpl': f'{DOWNLOAD_DIR}/%(id)s_{timestamp}.%(ext)s',
@@ -209,7 +226,7 @@ def run_download_sync(url, quality):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update): return
     uid = update.effective_user.id
-    txt = f"👋 **Hello!**\nServer: {SERVER_TAG}\nLink bhejo (Insta, YT, Terabox)!"
+    txt = f"👋 **Hello!**\nServer: {SERVER_TAG}\n\n🔗 **Send Links:**\n- YouTube\n- Instagram\n- Terabox"
     if uid == OWNER_ID:
         txt += "\n\n👮‍♂️ **Admin:** `/add`, `/remove`, `/users`"
     await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
@@ -229,7 +246,7 @@ async def admin_ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else: msg = "❌ Cannot remove owner"
         save_users(AUTHORIZED_USERS)
         await update.message.reply_text(msg)
-    except: await update.message.reply_text("Usage: /add <id> or /remove <id>")
+    except: await update.message.reply_text("Usage: /add <id>")
 
 async def show_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID: return
@@ -242,10 +259,12 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data['url'] = url
     
-    # Terabox Detection
-    if "terabox" in url or "1024tera" in url:
+    # URL Detection Logic
+    terabox_domains = ["terabox", "1024tera", "teraboxurl", "4funbox"]
+    
+    if any(d in url for d in terabox_domains):
         keyboard = [[InlineKeyboardButton("⬇️ Download Terabox File", callback_data="terabox")]]
-        txt = "📦 **Terabox Link Detected!**\n(Note: 50MB Server Limit applies)"
+        txt = "📦 **Terabox Link Detected!**\n(Processing might take 10-20s)"
     elif "youtube" in url or "youtu.be" in url:
         keyboard = [
             [InlineKeyboardButton("🎵 MP3", callback_data="audio")],
@@ -253,8 +272,8 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         txt = "📺 **YouTube Detected**"
     else:
-        keyboard = [[InlineKeyboardButton("⬇️ Download Video", callback_data="best")]]
-        txt = "📸 **Social Link Detected**"
+        keyboard = [[InlineKeyboardButton("⬇️ Download Media", callback_data="best")]]
+        txt = "📸 **Link Detected**"
 
     await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
 
@@ -265,11 +284,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     data = query.data
     url = context.user_data.get('url')
-    
-    # Map 'terabox' button to 'best' quality for logic
     quality = 'best' if data == 'terabox' else data
     
-    await query.edit_message_text(f"⚡ **Downloading...**\n(This may take time)")
+    await query.edit_message_text(f"⚡ **Downloading...**\n⏳ Please wait...")
     
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(executor, run_download_sync, url, quality)
@@ -302,7 +319,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         await query.delete_message()
     except Exception as e:
-        await query.edit_message_text("❌ Upload Error")
+        logger.error(f"Upload Error: {e}")
+        await query.edit_message_text("❌ Upload Error.")
     finally:
         if os.path.exists(path): os.remove(path)
 
@@ -321,7 +339,6 @@ async def main():
         await app_bot.bot.set_webhook(url=f"{WEBHOOK_URL}/webhook", allowed_updates=Update.ALL_TYPES)
     return app_bot
 
-# --- RUN ---
 try:
     loop = asyncio.get_event_loop()
 except RuntimeError:
