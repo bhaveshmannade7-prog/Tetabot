@@ -5,6 +5,7 @@ import time
 import sys
 import ujson as json
 import requests
+import re
 import random
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request
@@ -22,9 +23,9 @@ try:
 except:
     OWNER_ID = 0
 
-# Cookie Configuration
+# Cookie Setup
 COOKIES_ENV = os.getenv("COOKIES_CONTENT")
-TERABOX_COOKIE_VAL = os.getenv("TERABOX_COOKIE")  # Sirf 'ndus' value yahan layein
+TERABOX_COOKIE_VAL = os.getenv("TERABOX_COOKIE") 
 API_MODE = os.getenv("API_MODE", "standard")
 
 # --- SETTINGS ---
@@ -32,14 +33,13 @@ DOWNLOAD_DIR = "downloads"
 DATA_FILE = "users.json"
 COOKIE_FILE = "cookies.txt"
 
-# Limit Settings
 if API_MODE == 'local':
     BASE_URL = "http://localhost:8081/bot"
-    MAX_FILE_SIZE = 1950 * 1024 * 1024  # 2GB
+    MAX_FILE_SIZE = 1950 * 1024 * 1024
     SERVER_TAG = "🚀 Local Server (2GB)"
 else:
     BASE_URL = None
-    MAX_FILE_SIZE = 49 * 1024 * 1024    # 50MB
+    MAX_FILE_SIZE = 49 * 1024 * 1024
     SERVER_TAG = "☁️ Cloud Server (50MB)"
 
 # Logging
@@ -50,7 +50,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("BotEngine")
 
-# --- DATA MANAGEMENT ---
+# --- DATA ---
 def load_users():
     if not os.path.exists(DATA_FILE): return {OWNER_ID}
     try:
@@ -67,11 +67,9 @@ def save_users(users_set):
 
 AUTHORIZED_USERS = load_users()
 
-# --- COOKIE GENERATOR ---
+# --- COOKIE FILE GENERATOR ---
 def setup_cookies():
     valid_lines = ["# Netscape HTTP Cookie File"]
-    
-    # 1. Standard Cookies
     if COOKIES_ENV and len(COOKIES_ENV) > 10:
         lines = COOKIES_ENV.split('\n')
         for line in lines:
@@ -79,17 +77,7 @@ def setup_cookies():
             if len(parts) >= 7 and not line.startswith('#'):
                 valid_lines.append("\t".join(parts))
     
-    # 2. Terabox Specific (ndus)
-    # Ye bohot zaroori hai agar aapne alag se variable set kiya hai
-    if TERABOX_COOKIE_VAL and len(TERABOX_COOKIE_VAL) > 5:
-        # Domain fix for Terabox
-        tb_line = f".terabox.com\tTRUE\t/\tFALSE\t2147483647\tndus\t{TERABOX_COOKIE_VAL.strip()}"
-        valid_lines.append(tb_line)
-        # 1024tera domain ke liye bhi same cookie register karein
-        tb_line_2 = f".1024tera.com\tTRUE\t/\tFALSE\t2147483647\tndus\t{TERABOX_COOKIE_VAL.strip()}"
-        valid_lines.append(tb_line_2)
-        logger.info("✅ Terabox Cookies Injected!")
-
+    # Cookie File sirf YT ke liye rakhenge, Terabox manual handle karenge
     with open(COOKIE_FILE, 'w') as f:
         f.write("\n".join(valid_lines))
         f.write("\n")
@@ -115,136 +103,171 @@ async def check_auth(update: Update):
         return False
     return True
 
-# --- DOWNLOAD ENGINES ---
+# --- TERABOX DIRECT SCRAPER ENGINE ---
 
-def resolve_url(url):
-    """Short links (teraboxurl.com) ko full links me badalta hai"""
+def resolve_terabox(url):
+    """
+    Follows redirects to get the real 'surl' link.
+    """
     try:
-        session = requests.Session()
-        session.headers.update({"User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"})
-        resp = session.get(url, allow_redirects=True, timeout=10)
-        return resp.url
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"}
+        r = requests.get(url, headers=headers, allow_redirects=True, timeout=10)
+        return r.url
     except:
         return url
+
+def get_terabox_download_link(url, cookie_value):
+    """
+    Manual HTML Parsing Method (Bypasses API Checks)
+    """
+    session = requests.Session()
+    
+    # 1. Critical Headers
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+    }
+    
+    # Add Cookie manually to header
+    if cookie_value:
+        headers["Cookie"] = f"ndus={cookie_value}"
+        logger.info("🍪 Using provided 'ndus' cookie for request.")
+    else:
+        logger.warning("⚠️ No Terabox Cookie Found! Download might fail.")
+
+    try:
+        # 2. Get the Page HTML
+        logger.info(f"Scraping Page: {url}")
+        resp = session.get(url, headers=headers, timeout=15)
+        
+        # 3. Search for 'dlink' inside the HTML scripts
+        # Terabox aksar JSON format me dlink chupata hai page ke andar
+        html = resp.text
+        
+        # Pattern 1: Direct dlink match
+        matches = re.findall(r'"dlink":"(.*?)"', html)
+        if matches:
+            dlink = matches[0].replace("\\/", "/")
+            logger.info("✅ Found dlink via Pattern 1")
+            return dlink, "Terabox_Video.mp4"
+            
+        # Pattern 2: URL decoding match
+        matches_2 = re.findall(r'dlink%22%3A%22(.*?)%22', html)
+        if matches_2:
+            dlink = requests.utils.unquote(matches_2[0])
+            logger.info("✅ Found dlink via Pattern 2")
+            return dlink, "Terabox_Video.mp4"
+            
+        # Pattern 3: Look for 'list' JSON
+        if "list" in html:
+            try:
+                # Extract the JS object usually containing file list
+                json_part = re.search(r'\[\{.*?"dlink":".*?\}\]', html)
+                if json_part:
+                    data = json.loads(json_part.group(0))
+                    if data and "dlink" in data[0]:
+                        logger.info("✅ Found dlink via JSON Pattern")
+                        return data[0]["dlink"], data[0].get("server_filename", "Terabox_Video.mp4")
+            except: pass
+
+        logger.warning("❌ Scraping failed. HTML didn't contain simple dlink.")
+        return None, None
+        
+    except Exception as e:
+        logger.error(f"Scraper Error: {e}")
+        return None, None
 
 def download_video_engine(url, quality):
     if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
     timestamp = int(time.time())
     
-    # 1. URL Analysis
-    is_terabox = any(d in url for d in ["terabox", "1024tera", "teraboxurl", "4funbox", "nephobox"])
+    is_terabox = any(d in url for d in ["terabox", "1024tera", "teraboxurl", "4funbox"])
     is_yt = "youtube.com" in url or "youtu.be" in url
-    
-    # 2. Resolve Terabox Redirects
-    if is_terabox:
-        url = resolve_url(url)
-        # Force 1024tera domain (Better API success rate)
-        if "terabox.com" in url: url = url.replace("terabox.com", "1024tera.com")
-        logger.info(f"Processing URL: {url}")
 
-    # 3. User-Agent Strategy
-    # Terabox mobile traffic ko kam block karta hai, isliye hum Mobile UA use karenge
+    # --- TERABOX LOGIC (NEW) ---
     if is_terabox:
-        user_agent = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-    else:
-        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        final_url = resolve_terabox(url)
+        
+        # Try 1: Manual Scraper with Cookie
+        dlink, title = get_terabox_download_link(final_url, TERABOX_COOKIE_VAL)
+        
+        # Try 2: Fallback API (NepCoder) if Scraper fails
+        if not dlink:
+            logger.info("🔄 Scraper failed, trying fallback API...")
+            try:
+                api_url = f"https://teraboxvideodownloader.nepcoderdevs.workers.dev/?url={final_url}"
+                r = requests.get(api_url, timeout=15)
+                data = r.json()
+                dlink = data.get("response", [{}])[0].get("resolutions", {}).get("Fast Download")
+                if dlink: title = data.get("response", [{}])[0].get("title", "Terabox_Video")
+            except Exception as e:
+                logger.error(f"Fallback API Error: {e}")
 
-    # 4. yt-dlp Configuration
+        if dlink:
+            filename = f"{DOWNLOAD_DIR}/tb_{timestamp}.mp4"
+            headers_dl = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Cookie": f"ndus={TERABOX_COOKIE_VAL}" if TERABOX_COOKIE_VAL else ""
+            }
+            
+            try:
+                with requests.get(dlink, stream=True, headers=headers_dl, timeout=30) as r:
+                    r.raise_for_status()
+                    with open(filename, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=1024*1024):
+                            if chunk: f.write(chunk)
+                
+                return {"status": True, "path": filename, "title": title, "duration": 0, "width": 0, "height": 0}
+            except Exception as e:
+                return {"status": False, "error": f"Download Interrupted: {str(e)}"}
+        else:
+            return {"status": False, "error": "All methods (Scraper & API) failed. Cookie might be invalid for Cloud IP."}
+
+    # --- YOUTUBE LOGIC (STANDARD) ---
+    fmt = 'bestvideo+bestaudio/best' if quality == 'best' else f'bestvideo[height<={quality}]+bestaudio/best'
+    if quality == 'audio': fmt = 'bestaudio/best'
+
     opts = {
         'outtmpl': f'{DOWNLOAD_DIR}/%(id)s_{timestamp}.%(ext)s',
+        'format': fmt,
         'quiet': True,
         'no_warnings': True,
         'geo_bypass': True,
         'nocheckcertificate': True,
-        'user_agent': user_agent,
         'noplaylist': True,
-        # Network Fixes
-        'socket_timeout': 30,
-        'retries': 10,
     }
-
-    # Format Logic
-    if is_yt:
-        fmt = 'bestvideo+bestaudio/best' if quality == 'best' else f'bestvideo[height<={quality}]+bestaudio/best'
-        if quality == 'audio': fmt = 'bestaudio/best'
-    else:
-        fmt = 'best'
-    opts['format'] = fmt
-
-    # Cookie Attachment
-    if os.path.exists(COOKIE_FILE):
-        opts['cookiefile'] = COOKIE_FILE
-
-    # YouTube Specifics
+    
+    if os.path.exists(COOKIE_FILE): opts['cookiefile'] = COOKIE_FILE
+    
     if quality == 'audio':
         opts['postprocessors'] = [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}]
     elif is_yt:
         opts['merge_output_format'] = 'mp4'
 
-    # --- EXECUTION ---
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
-            
             base, _ = os.path.splitext(filename)
             final_path = base + (".mp3" if quality == 'audio' else ".mp4")
             
-            if not os.path.exists(final_path) and os.path.exists(filename):
-                final_path = filename
+            if not os.path.exists(final_path) and os.path.exists(filename): final_path = filename
                 
             return {
                 "status": True,
                 "path": final_path,
-                "title": info.get('title', 'Media File'),
+                "title": info.get('title', 'Media'),
                 "duration": info.get('duration'),
                 "width": info.get('width'),
                 "height": info.get('height')
             }
-
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Engine Failed: {error_msg}")
-        
-        # --- FALLBACK SYSTEM ---
-        # Agar yt-dlp cookie ke bawajood fail ho jaye, to hum Direct Request method try karenge
-        if is_terabox:
-             logger.info("Triggering Fallback for Terabox...")
-             return fallback_terabox_direct(url)
-             
-        return {"status": False, "error": f"Failed: {error_msg[:100]}"}
-
-def fallback_terabox_direct(url):
-    """
-    Direct Download using Headers + Cookies (Bypassing yt-dlp)
-    """
-    try:
-        # 1. API se Link nikalo (NepCoder usually works)
-        api = f"https://teraboxvideodownloader.nepcoderdevs.workers.dev/?url={url}"
-        r = requests.get(api, timeout=20)
-        data = r.json()
-        
-        # Try to find a valid link
-        link = data.get("response", [{}])[0].get("resolutions", {}).get("Fast Download")
-        title = data.get("response", [{}])[0].get("title", "Terabox_Video")
-        
-        if not link:
-            return {"status": False, "error": "All methods failed. Cookies might be expired."}
-        
-        # 2. Download Stream
-        filename = f"{DOWNLOAD_DIR}/tb_fallback_{int(time.time())}.mp4"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-        }
-        
-        with requests.get(link, stream=True, headers=headers, timeout=30) as dl:
-            dl.raise_for_status()
-            with open(filename, 'wb') as f:
-                for chunk in dl.iter_content(chunk_size=1024*1024):
-                    if chunk: f.write(chunk)
-                    
-        return {"status": True, "path": filename, "title": title, "duration": 0, "width": 0, "height": 0}
-        
     except Exception as e:
         return {"status": False, "error": str(e)}
 
@@ -253,8 +276,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update): return
     uid = update.effective_user.id
     
-    c_stat = "✅ Active" if os.path.exists(COOKIE_FILE) else "⚠️ Missing"
-    txt = f"👋 **Bot Ready!**\n🍪 Cookies: {c_stat}\n⚡ Server: {SERVER_TAG}\n\nLink bhejo!"
+    cookie_state = "✅ Loaded" if TERABOX_COOKIE_VAL else "⚠️ Not Set"
+    txt = f"👋 **Bot Active!**\n🍪 Terabox Cookie: {cookie_state}\n⚡ Server: {SERVER_TAG}\n\nLink bhejo!"
     
     if uid == OWNER_ID: txt += "\n\n👮‍♂️ **Admin:** `/add`, `/remove`"
     await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
@@ -268,7 +291,7 @@ async def admin_ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif cmd == "/remove": 
             if target != OWNER_ID: AUTHORIZED_USERS.discard(target)
         save_users(AUTHORIZED_USERS)
-        await update.message.reply_text(f"✅ Action {cmd} complete.")
+        await update.message.reply_text("✅ Done")
     except: await update.message.reply_text("Usage: `/add 12345`")
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -278,12 +301,9 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data['url'] = url
     
-    # Smart Detection
-    tb_domains = ["terabox", "1024tera", "teraboxurl", "4funbox"]
-    
-    if any(d in url for d in tb_domains):
+    if any(d in url for d in ["terabox", "1024tera", "teraboxurl", "4funbox"]):
         keyboard = [[InlineKeyboardButton("⬇️ Fast Download", callback_data="terabox")]]
-        txt = "📦 **Terabox Detected!**\n(Using Cookie + Mobile Agent)"
+        txt = "📦 **Terabox Link Detected!**"
     elif "youtube" in url or "youtu.be" in url:
         keyboard = [[InlineKeyboardButton("🎵 MP3", callback_data="audio")],
                     [InlineKeyboardButton("720p", callback_data="720"), InlineKeyboardButton("Best", callback_data="best")]]
@@ -303,7 +323,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = context.user_data.get('url')
     quality = 'best' if data == 'terabox' else data
     
-    await query.edit_message_text(f"⚡ **Processing...**\n(Modes: Cookie > API > Fallback)")
+    await query.edit_message_text(f"⚡ **Processing...**\n🔍 Scraping Link...")
     
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(executor, download_video_engine, url, quality)
@@ -329,17 +349,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await context.bot.send_video(chat_id=update.effective_chat.id, video=f, caption=result['title'], supports_streaming=True, read_timeout=120, write_timeout=120)
         await query.delete_message()
-    except Exception as e:
-        logger.error(f"Upload Fail: {e}")
-        await query.edit_message_text("❌ Upload Error (Timeout).")
+    except Exception:
+        await query.edit_message_text("❌ Upload Error.")
     finally:
         if os.path.exists(path): os.remove(path)
 
-# --- STARTUP WITH FIXES ---
+# --- STARTUP ---
 async def main():
-    # TIMEOUT FIX: Connection timeouts increased to 120s to prevent crash logs
     req = HTTPXRequest(connection_pool_size=10, read_timeout=120, write_timeout=120, connect_timeout=120)
-    
     app_bot = Application.builder().token(BOT_TOKEN).request(req).build()
 
     app_bot.add_handler(CommandHandler("start", start))
