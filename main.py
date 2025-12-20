@@ -16,7 +16,12 @@ import yt_dlp
 # --- CONFIGURATION & SECRETS ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+# Ensure Owner ID is integer
+try:
+    OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+except:
+    OWNER_ID = 0
+
 COOKIES_ENV = os.getenv("COOKIES_CONTENT")
 API_MODE = os.getenv("API_MODE", "standard")
 
@@ -109,34 +114,59 @@ async def check_auth(update: Update):
         return False
     return True
 
-# --- DOWNLOAD ENGINE ---
+# --- DOWNLOAD ENGINE (UPDATED) ---
+def is_youtube(url):
+    return "youtube.com" in url or "youtu.be" in url
+
 def run_download_sync(url, quality):
     if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
     timestamp = int(time.time())
     
-    format_map = {
-        'audio': 'bestaudio/best',
-        '360': 'bestvideo[height<=360]+bestaudio/best[height<=360]',
-        '720': 'bestvideo[height<=720]+bestaudio/best[height<=720]',
-        '1080': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]',
-        'best': 'bestvideo+bestaudio/best'
-    }
+    # Check if URL is YouTube
+    is_yt = is_youtube(url)
     
+    # --- Format Logic ---
+    # Agar YouTube hai to Advanced format use karo, nahi to simple 'best' use karo (Insta/Terabox ke liye)
+    if is_yt:
+        if quality == 'audio':
+            fmt = 'bestaudio/best'
+        elif quality == '360':
+            fmt = 'bestvideo[height<=360]+bestaudio/best[height<=360]'
+        elif quality == '720':
+            fmt = 'bestvideo[height<=720]+bestaudio/best[height<=720]'
+        elif quality == '1080':
+            fmt = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]'
+        else:
+            fmt = 'bestvideo+bestaudio/best'
+    else:
+        # Instagram/Terabox/Facebook Fix:
+        # Ye platforms alag-alag streams nahi dete, isliye 'merge' logic fail hota hai.
+        # Simple 'best' use karne se error nahi ayega.
+        if quality == 'audio':
+             fmt = 'bestaudio/best'
+        else:
+             fmt = 'best' 
+
     opts = {
         'outtmpl': f'{DOWNLOAD_DIR}/%(id)s_{timestamp}.%(ext)s',
-        'format': format_map.get(quality, 'best'),
+        'format': fmt,
         'quiet': True,
         'no_warnings': True,
         'geo_bypass': True,
         'nocheckcertificate': True,
+        # Browser masquerade help karta hai insta/terabox ke liye
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
     }
     
-    if os.path.exists(COOKIE_FILE):
+    # --- Cookie Logic ---
+    # Sirf tab cookie use karo jab link YouTube ka ho
+    if is_yt and os.path.exists(COOKIE_FILE):
         opts['cookiefile'] = COOKIE_FILE
 
     if quality == 'audio':
         opts['postprocessors'] = [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}]
-    else:
+    elif is_yt:
+        # Merge sirf YouTube ke liye zaroori hai
         opts['merge_output_format'] = 'mp4'
 
     try:
@@ -146,6 +176,7 @@ def run_download_sync(url, quality):
             base, _ = os.path.splitext(filename)
             final_path = base + (".mp3" if quality == 'audio' else ".mp4")
             
+            # Agar file format rename nahi hua (Insta cases)
             if not os.path.exists(final_path) and os.path.exists(filename):
                 final_path = filename
 
@@ -164,10 +195,31 @@ def run_download_sync(url, quality):
 # --- HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update): return
-    await update.message.reply_text(
-        f"👋 **Online!**\nServer: {SERVER_TAG}\nLink bhejo!", 
-        parse_mode=ParseMode.MARKDOWN
+    
+    user_id = update.effective_user.id
+    first_name = update.effective_user.first_name
+    
+    # Debugging log
+    logger.info(f"Start Command by: {user_id} (Owner: {OWNER_ID})")
+    
+    welcome_text = (
+        f"👋 **Namaste, {first_name}!**\n\n"
+        f"🤖 **Bot Status:** Online\n"
+        f"⚡ **Server:** {SERVER_TAG}\n"
+        "🔗 **Instagram, YouTube, Terabox Link Bhejo!**"
     )
+    
+    # Admin Panel Check
+    if user_id == OWNER_ID:
+        welcome_text += (
+            "\n\n👮‍♂️ **Admin Controls:**\n"
+            "• `/add <id>` - User Access dein\n"
+            "• `/remove <id>` - Access hatayein\n"
+            "• `/users` - User list dekhein\n"
+            "• `/logs` - Check Logs (Console)"
+        )
+        
+    await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
 
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID: return
@@ -175,31 +227,57 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_id = int(context.args[0])
         AUTHORIZED_USERS.add(new_id)
         save_users(AUTHORIZED_USERS)
-        await update.message.reply_text(f"✅ User {new_id} Added.")
-    except: await update.message.reply_text("Usage: /add <id>")
+        await update.message.reply_text(f"✅ **User {new_id} Added!**")
+    except: await update.message.reply_text("Usage: `/add 123456`")
 
 async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID: return
     try:
         target_id = int(context.args[0])
-        if target_id in AUTHORIZED_USERS and target_id != OWNER_ID:
+        if target_id == OWNER_ID:
+            await update.message.reply_text("❌ Aap khud ko remove nahi kar sakte.")
+            return
+        if target_id in AUTHORIZED_USERS:
             AUTHORIZED_USERS.remove(target_id)
             save_users(AUTHORIZED_USERS)
-            await update.message.reply_text(f"🗑️ User {target_id} Removed.")
-    except: await update.message.reply_text("Usage: /remove <id>")
+            await update.message.reply_text(f"🗑️ **User {target_id} Removed!**")
+    except: await update.message.reply_text("Usage: `/remove 123456`")
+
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID: return
+    txt = "👥 **Authorized Users:**\n"
+    for uid in AUTHORIZED_USERS:
+        txt += f"`{uid}`\n"
+    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update): return
     url = update.message.text.strip()
-    if not url.startswith("http"): return
+    
+    # Basic URL validation
+    if not url.startswith(("http", "www")): 
+        return
 
     context.user_data['url'] = url
-    keyboard = [
-        [InlineKeyboardButton("🎵 MP3", callback_data="audio")],
-        [InlineKeyboardButton("🎥 360p", callback_data="360"), InlineKeyboardButton("🎥 720p", callback_data="720")],
-        [InlineKeyboardButton("💎 1080p", callback_data="1080"), InlineKeyboardButton("🔥 Best", callback_data="best")]
-    ]
-    await update.message.reply_text(f"🔗 Link Received. Select Quality:", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    # UI Customization based on link type
+    if "youtube.com" in url or "youtu.be" in url:
+        # YouTube: Full options
+        keyboard = [
+            [InlineKeyboardButton("🎵 MP3", callback_data="audio")],
+            [InlineKeyboardButton("360p", callback_data="360"), InlineKeyboardButton("720p", callback_data="720")],
+            [InlineKeyboardButton("1080p", callback_data="1080"), InlineKeyboardButton("Best Video", callback_data="best")]
+        ]
+        msg_text = "📺 **YouTube Link Detected**\nSelect Quality:"
+    else:
+        # Insta/Terabox: Simple options (avoid complex formats)
+        keyboard = [
+            [InlineKeyboardButton("🎵 Audio Only", callback_data="audio")],
+            [InlineKeyboardButton("⬇️ Download Video", callback_data="best")]
+        ]
+        msg_text = "📸 **Social Media Link Detected**\n(Instagram/Terabox/Other)\nSelect Option:"
+
+    await update.message.reply_text(msg_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -209,61 +287,75 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     quality = query.data
     url = context.user_data.get('url')
     
-    await query.edit_message_text(f"⚡ Downloading `{quality}`...", parse_mode=ParseMode.MARKDOWN)
+    # Edit message to show processing
+    await query.edit_message_text(f"⚡ **Downloading...**\n⏳ Please wait...", parse_mode=ParseMode.MARKDOWN)
     
+    # Run in thread
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(executor, run_download_sync, url, quality)
     
     if not result['status']:
-        await query.edit_message_text(f"❌ Error: {result.get('error')}")
+        # Agar error aaya
+        error_msg = result.get('error')
+        if "Too Many Requests" in error_msg:
+            friendly_err = "❌ Rate Limit Hit (Try again later)"
+        elif "Sign in" in error_msg:
+            friendly_err = "❌ Content is Private or Requires Login"
+        else:
+            friendly_err = f"❌ Error: {error_msg[:100]}..." # Show short error
+            
+        await query.edit_message_text(friendly_err)
         return
 
     path = result['path']
     size = os.path.getsize(path)
     
     if size > MAX_FILE_SIZE:
-        await query.edit_message_text(f"❌ File too big ({get_readable_size(size)}). Limit: {get_readable_size(MAX_FILE_SIZE)}")
+        await query.edit_message_text(f"❌ **File Too Big!**\nSize: {get_readable_size(size)}\nLimit: {get_readable_size(MAX_FILE_SIZE)}")
         os.remove(path)
         return
 
-    await query.edit_message_text(f"📤 Uploading ({get_readable_size(size)})...")
+    await query.edit_message_text(f"📤 **Uploading...**\n📦 Size: {get_readable_size(size)}")
     
     try:
         with open(path, 'rb') as f:
             if quality == 'audio':
                 await context.bot.send_audio(
-                    chat_id=update.effective_chat.id, audio=f, title=result['title'],
+                    chat_id=update.effective_chat.id, 
+                    audio=f, 
+                    title=result['title'],
+                    caption="🤖 Via Bot",
                     read_timeout=120, write_timeout=120, connect_timeout=60
                 )
             else:
                 await context.bot.send_video(
-                    chat_id=update.effective_chat.id, video=f, caption=result['title'],
-                    width=result.get('width'), height=result.get('height'), duration=result.get('duration'),
-                    supports_streaming=True, read_timeout=120, write_timeout=120, connect_timeout=60
+                    chat_id=update.effective_chat.id, 
+                    video=f, 
+                    caption=f"🎬 {result['title']}",
+                    width=result.get('width'), 
+                    height=result.get('height'), 
+                    duration=result.get('duration'),
+                    supports_streaming=True, 
+                    read_timeout=120, write_timeout=120, connect_timeout=60
                 )
         await query.delete_message()
     except Exception as e:
         logger.error(f"Upload Fail: {e}")
-        await query.edit_message_text("❌ Upload Failed.")
+        await query.edit_message_text("❌ Upload Failed (Telegram Error).")
     finally:
         if os.path.exists(path): os.remove(path)
 
 # --- ERROR HANDLER ---
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
-    # Ignore network errors to prevent crash loops
-    if isinstance(context.error, (TimedOut, NetworkError)):
-        logger.warning("⚠️ Network Timeout detected. Ignoring.")
-        return
 
-# --- INITIALIZATION ---
+# --- MAIN ---
 async def main():
-    # Fix: Increased timeouts to prevent "ConnectTimeout"
     request_params = HTTPXRequest(
         connection_pool_size=20,
-        read_timeout=30.0,   # Increased from default
-        write_timeout=30.0,  # Increased from default
-        connect_timeout=30.0 # Critical fix for Render
+        read_timeout=30.0,
+        write_timeout=30.0,
+        connect_timeout=30.0
     )
     
     builder = Application.builder().token(BOT_TOKEN).request(request_params)
@@ -273,6 +365,7 @@ async def main():
     app_bot.add_handler(CommandHandler("start", start))
     app_bot.add_handler(CommandHandler("add", add_user))
     app_bot.add_handler(CommandHandler("remove", remove_user))
+    app_bot.add_handler(CommandHandler("users", list_users))
     app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     app_bot.add_handler(CallbackQueryHandler(button_callback))
     app_bot.add_error_handler(error_handler)
@@ -283,8 +376,7 @@ async def main():
     
     return app_bot
 
-# --- ENTRY POINT ---
-# Global Loop setup for Gunicorn
+# Entry point
 try:
     loop = asyncio.get_event_loop()
 except RuntimeError:
@@ -297,7 +389,6 @@ bot_app = loop.run_until_complete(main())
 def webhook():
     if request.method == "POST":
         update = Update.de_json(request.get_json(force=True), bot_app.bot)
-        # Use existing loop to process update
         loop.run_until_complete(bot_app.process_update(update))
         return "OK"
     return "Invalid"
