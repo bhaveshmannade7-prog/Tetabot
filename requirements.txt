@@ -1,6 +1,5 @@
-Flask[async]==2.3.3
-python-telegram-bot==20.6
-yt-dlp>=2024.10.0
-gunicorn==21.2.0
-python-dotenv==1.0.0
-nest-asyncio==1.5.8
+python-telegram-bot>=20.0
+flask
+yt-dlp
+ujson
+requests
