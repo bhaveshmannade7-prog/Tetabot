@@ -47,7 +47,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("BotEngine")
 
-# --- DATA ---
+# --- DATA MANAGEMENT ---
 def load_users():
     if not os.path.exists(DATA_FILE): return {OWNER_ID}
     try:
@@ -99,20 +99,17 @@ async def check_auth(update: Update):
         return False
     return True
 
-# --- TERABOX ADVANCED ENGINE ---
+# --- TERABOX MULTI-API ENGINE ---
 def resolve_terabox_url(url):
-    """
-    Short URL (teraboxurl.com) ko Full URL (terabox.com) me convert karta hai.
-    """
+    """Short URL to Full URL Resolver"""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
     }
     try:
-        # Allow redirects to find the final landing page
         response = requests.head(url, allow_redirects=True, headers=headers, timeout=10)
         return response.url
     except Exception as e:
-        logger.error(f"URL Resolve Error: {e}")
+        logger.error(f"Resolve Error: {e}")
         return url
 
 def download_terabox(url):
@@ -121,30 +118,64 @@ def download_terabox(url):
         timestamp = int(time.time())
         filename = f"{DOWNLOAD_DIR}/terabox_{timestamp}.mp4"
         
-        # Step 1: Resolve Short Links (Critical Fix)
+        # 1. Resolve URL
         final_url = resolve_terabox_url(url)
-        logger.info(f"Resolved URL: {final_url}")
+        logger.info(f"Target URL: {final_url}")
 
-        # Step 2: Try Primary API
-        # Using a public worker that handles redirects better
-        api_url = f"https://terabox-dl.qtcloud.workers.dev/api/get-download?url={final_url}"
-        
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
         }
-        
-        resp = requests.get(api_url, headers=headers, timeout=20)
-        data = resp.json()
-        
-        # Validation
-        if "downloadLink" not in data:
-            logger.error(f"Terabox API Response: {data}")
-            return {"status": False, "error": "Link Expired or Server Busy"}
-            
-        direct_link = data["downloadLink"]
-        file_title = data.get("filename", f"Terabox_{timestamp}.mp4")
-        
-        # Step 3: Download
+
+        # 2. List of Public APIs (Failover System)
+        # Bot ek-ek karke try karega jab tak kaam na bane
+        api_endpoints = [
+            # API 1: HNN Workers
+            f"https://terabox.hnn.workers.dev/api/get-download?url={final_url}",
+            # API 2: QTCloud (Backup)
+            f"https://terabox-dl.qtcloud.workers.dev/api/get-download?url={final_url}",
+            # API 3: Vercel Instance
+            f"https://terabox-downloader-six.vercel.app/api?url={final_url}"
+        ]
+
+        direct_link = None
+        file_title = f"Terabox_Video_{timestamp}.mp4"
+
+        for api_url in api_endpoints:
+            try:
+                logger.info(f"Trying API: {api_url}")
+                resp = requests.get(api_url, headers=headers, timeout=15)
+                
+                if resp.status_code != 200:
+                    logger.warning(f"API returned {resp.status_code}, skipping...")
+                    continue
+                
+                # Try parsing JSON (Isi step par error aa raha tha)
+                try:
+                    data = resp.json()
+                except json.JSONDecodeError:
+                    logger.warning("API returned Invalid JSON, skipping...")
+                    continue
+
+                # Check for link keys in various API formats
+                if "downloadLink" in data:
+                    direct_link = data["downloadLink"]
+                elif "url" in data and "http" in data["url"]: # Some APIs return {'url': '...'}
+                    direct_link = data["url"]
+                elif "dlink" in data:
+                    direct_link = data["dlink"]
+
+                if direct_link:
+                    if "filename" in data: file_title = data["filename"]
+                    break # Link mil gaya, loop break karo
+
+            except Exception as e:
+                logger.error(f"API connection failed: {e}")
+                continue
+
+        if not direct_link:
+            return {"status": False, "error": "All Terabox APIs are busy or down. Try again later."}
+
+        # 3. Download from Direct Link
         with requests.get(direct_link, stream=True, headers=headers) as r:
             r.raise_for_status()
             with open(filename, 'wb') as f:
@@ -159,21 +190,21 @@ def download_terabox(url):
             "width": 1280,
             "height": 720
         }
-        
+
     except Exception as e:
-        logger.error(f"Terabox Fail: {e}")
+        logger.error(f"Terabox Final Error: {e}")
         return {"status": False, "error": f"Failed: {str(e)[:50]}"}
 
 # --- MAIN ENGINE ---
 def run_download_sync(url, quality):
     if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
     
-    # 1. Detect Terabox (Expanded List)
-    terabox_domains = ["terabox", "1024tera", "teraboxurl", "4funbox", "momerybox"]
+    # Detect Terabox Variants
+    terabox_domains = ["terabox", "1024tera", "teraboxurl", "4funbox", "momerybox", "nephobox"]
     if any(domain in url for domain in terabox_domains):
         return download_terabox(url)
 
-    # 2. YT/Insta Logic
+    # Standard Engine (YT/Insta)
     timestamp = int(time.time())
     is_yt = "youtube.com" in url or "youtu.be" in url
     
@@ -181,7 +212,7 @@ def run_download_sync(url, quality):
         fmt = 'bestvideo+bestaudio/best' if quality == 'best' else f'bestvideo[height<={quality}]+bestaudio/best'
         if quality == 'audio': fmt = 'bestaudio/best'
     else:
-        fmt = 'best' # Insta Safe Mode
+        fmt = 'best' # Insta/FB Safe Mode
 
     opts = {
         'outtmpl': f'{DOWNLOAD_DIR}/%(id)s_{timestamp}.%(ext)s',
@@ -190,7 +221,7 @@ def run_download_sync(url, quality):
         'no_warnings': True,
         'geo_bypass': True,
         'nocheckcertificate': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36',
     }
     
     if is_yt and os.path.exists(COOKIE_FILE):
@@ -226,7 +257,7 @@ def run_download_sync(url, quality):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update): return
     uid = update.effective_user.id
-    txt = f"👋 **Hello!**\nServer: {SERVER_TAG}\n\n🔗 **Send Links:**\n- YouTube\n- Instagram\n- Terabox"
+    txt = f"👋 **Hello!**\nServer: {SERVER_TAG}\n\n🔗 **Supported:** YT, Insta, Terabox, etc."
     if uid == OWNER_ID:
         txt += "\n\n👮‍♂️ **Admin:** `/add`, `/remove`, `/users`"
     await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
@@ -259,12 +290,12 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data['url'] = url
     
-    # URL Detection Logic
-    terabox_domains = ["terabox", "1024tera", "teraboxurl", "4funbox"]
+    # Detection
+    terabox_domains = ["terabox", "1024tera", "teraboxurl", "4funbox", "momerybox", "nephobox"]
     
     if any(d in url for d in terabox_domains):
         keyboard = [[InlineKeyboardButton("⬇️ Download Terabox File", callback_data="terabox")]]
-        txt = "📦 **Terabox Link Detected!**\n(Processing might take 10-20s)"
+        txt = "📦 **Terabox Link Detected!**"
     elif "youtube" in url or "youtu.be" in url:
         keyboard = [
             [InlineKeyboardButton("🎵 MP3", callback_data="audio")],
@@ -286,7 +317,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = context.user_data.get('url')
     quality = 'best' if data == 'terabox' else data
     
-    await query.edit_message_text(f"⚡ **Downloading...**\n⏳ Please wait...")
+    await query.edit_message_text(f"⚡ **Downloading...**\n⏳ Processing (API Retries enabled)...")
     
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(executor, run_download_sync, url, quality)
