@@ -29,14 +29,14 @@ DOWNLOAD_DIR = "downloads"
 DATA_FILE = "users.json"
 COOKIE_FILE = "cookies.txt"
 
-# File Size Limits
+# Limit Settings
 if API_MODE == 'local':
     BASE_URL = "http://localhost:8081/bot"
     MAX_FILE_SIZE = 1950 * 1024 * 1024  # 2GB
     SERVER_TAG = "🚀 Local Server (2GB)"
 else:
     BASE_URL = None
-    MAX_FILE_SIZE = 49 * 1024 * 1024    # 50MB (Telegram Cloud Limit)
+    MAX_FILE_SIZE = 49 * 1024 * 1024    # 50MB
     SERVER_TAG = "☁️ Cloud Server (50MB)"
 
 # Logging
@@ -47,7 +47,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("BotEngine")
 
-# --- DATA MANAGEMENT (Admin System) ---
+# --- DATA MANAGEMENT ---
 def load_users():
     if not os.path.exists(DATA_FILE): return {OWNER_ID}
     try:
@@ -95,21 +95,32 @@ async def check_auth(update: Update):
     if not update.effective_user: return False
     uid = update.effective_user.id
     if uid not in AUTHORIZED_USERS:
-        try: await update.message.reply_text("🔒 **Access Denied!** Contact Admin.")
+        try: await update.message.reply_text("🔒 **Access Denied!**")
         except: pass
         return False
     return True
 
-# --- MOVIE SEARCH ENGINE (YTS API) ---
+# --- FIXED MOVIE SEARCH ENGINE ---
 def search_movie_api(query_term):
     """
-    Searches for movies using YTS Public API.
-    Returns list of movies with title, year, and torrent links.
+    Searches YTS with Real Browser Headers to bypass blocking.
     """
     try:
         url = "https://yts.mx/api/v2/list_movies.json"
         params = {"query_term": query_term, "limit": 5, "sort_by": "year"}
-        resp = requests.get(url, params=params, timeout=10)
+        
+        # FIX: Added Real Browser Headers
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+            "Accept": "application/json"
+        }
+        
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        
+        if resp.status_code != 200:
+            logger.error(f"API Blocked: {resp.status_code}")
+            return []
+            
         data = resp.json()
         
         if data.get("status") != "ok" or data.get("data", {}).get("movie_count") == 0:
@@ -120,14 +131,13 @@ def search_movie_api(query_term):
         logger.error(f"Movie API Error: {e}")
         return []
 
-# --- UNIVERSAL DOWNLOADER ENGINE ---
+# --- UNIVERSAL DOWNLOADER ---
 def run_downloader(url, quality):
     if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
     timestamp = int(time.time())
     
     is_yt = "youtube.com" in url or "youtu.be" in url
     
-    # Configuration
     opts = {
         'outtmpl': f'{DOWNLOAD_DIR}/%(id)s_{timestamp}.%(ext)s',
         'quiet': True,
@@ -135,12 +145,9 @@ def run_downloader(url, quality):
         'geo_bypass': True,
         'nocheckcertificate': True,
         'noplaylist': True,
-        'socket_timeout': 30,
-        # Browser Spoofing
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     }
 
-    # Format Logic
     if is_yt:
         fmt = 'bestvideo+bestaudio/best' if quality == 'best' else f'bestvideo[height<={quality}]+bestaudio/best'
         if quality == 'audio': fmt = 'bestaudio/best'
@@ -149,7 +156,7 @@ def run_downloader(url, quality):
         if quality == 'audio': 
             opts['postprocessors'] = [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}]
     else:
-        opts['format'] = 'best' # Universal fallback
+        opts['format'] = 'best'
 
     if os.path.exists(COOKIE_FILE): opts['cookiefile'] = COOKIE_FILE
 
@@ -157,12 +164,10 @@ def run_downloader(url, quality):
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
-            
             base, _ = os.path.splitext(filename)
             final_path = base + (".mp3" if quality == 'audio' else ".mp4")
             
-            if not os.path.exists(final_path) and os.path.exists(filename):
-                final_path = filename
+            if not os.path.exists(final_path) and os.path.exists(filename): final_path = filename
                 
             return {
                 "status": True,
@@ -176,59 +181,47 @@ def run_downloader(url, quality):
         return {"status": False, "error": str(e)}
 
 # --- HANDLERS ---
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update): return
     
-    user = update.effective_user.first_name
     txt = (
-        f"👋 **Hello {user}!**\n\n"
-        f"🚀 **Server:** {SERVER_TAG}\n\n"
-        "✨ **Features:**\n"
-        "1️⃣ **Universal Downloader:** Send any video link (Insta, YT, FB, Twitter).\n"
-        "2️⃣ **Movie Search:** `/search <Movie Name>` likhein."
+        f"👋 **Bot Active!**\nServer: {SERVER_TAG}\n\n"
+        "✨ **Commands:**\n"
+        "1️⃣ `/search <Name>` - Movie Search & Download\n"
+        "2️⃣ **Direct Link** - YouTube/Insta Downloader"
     )
-    
-    if update.effective_user.id == OWNER_ID:
-        txt += "\n\n👮‍♂️ **Admin:** `/add`, `/remove`, `/users`"
-        
+    if update.effective_user.id == OWNER_ID: txt += "\n\n👮‍♂️ Admin: `/add`, `/remove`"
     await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
 
 async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles /search command for movies"""
     if not await check_auth(update): return
     
     if not context.args:
-        await update.message.reply_text("❌ **Usage:** `/search Avengers`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("📝 Usage: `/search Iron Man`", parse_mode=ParseMode.MARKDOWN)
         return
     
     query = " ".join(context.args)
-    await update.message.reply_text(f"🔍 **Searching for:** `{query}`...")
+    await update.message.reply_text(f"🔍 **Searching:** `{query}`...")
     
     loop = asyncio.get_running_loop()
     movies = await loop.run_in_executor(executor, search_movie_api, query)
     
     if not movies:
-        await update.message.reply_text("❌ **No movies found!** Try a different name.")
+        await update.message.reply_text("❌ **No movies found!**\n(Try checking spelling or Server might be busy)")
         return
 
-    # Create Buttons for results
     keyboard = []
     for movie in movies:
         title = movie.get('title')
         year = movie.get('year')
-        movie_id = movie.get('id')
-        btn_text = f"🎬 {title} ({year})"
-        # Store movie ID in callback data
-        keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"mov_{movie_id}")])
+        mid = movie.get('id')
+        keyboard.append([InlineKeyboardButton(f"🎬 {title} ({year})", callback_data=f"mov_{mid}")])
     
-    # Store movie data in context for retrieval later (Simple cache)
     context.user_data['search_results'] = {str(m['id']): m for m in movies}
     
     await update.message.reply_text(
-        f"found {len(movies)} results for `{query}`:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.MARKDOWN
+        f"✅ Found {len(movies)} results:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 async def admin_ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -236,17 +229,11 @@ async def admin_ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         cmd, target = update.message.text.split()
         target = int(target)
-        if cmd == "/add": 
-            AUTHORIZED_USERS.add(target)
-            msg = "✅ User Added"
+        if cmd == "/add": AUTHORIZED_USERS.add(target)
         elif cmd == "/remove": 
-            if target != OWNER_ID: 
-                AUTHORIZED_USERS.discard(target)
-                msg = "🗑️ User Removed"
-            else: msg = "❌ Cannot remove Owner"
-        
+            if target != OWNER_ID: AUTHORIZED_USERS.discard(target)
         save_users(AUTHORIZED_USERS)
-        await update.message.reply_text(msg)
+        await update.message.reply_text("✅ Done")
     except: await update.message.reply_text("Usage: `/add 12345`")
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -256,125 +243,81 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data['url'] = url
     
-    # Generic Downloader UI
     keyboard = [
         [InlineKeyboardButton("🎵 Audio", callback_data="audio")],
         [InlineKeyboardButton("🎥 720p", callback_data="720"), InlineKeyboardButton("💎 Best", callback_data="best")]
     ]
     
-    if "youtube" in url or "youtu.be" in url:
-        site = "YouTube"
-    elif "instagram" in url:
-        site = "Instagram"
-    else:
-        site = "Web"
-
-    await update.message.reply_text(
-        f"🔗 **Link Detected: {site}**\n👇 Select Quality:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.MARKDOWN
-    )
+    await update.message.reply_text("🔗 **Link Detected!** Select Quality:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
     data = query.data
     
-    # --- MOVIE DOWNLOAD HANDLER ---
+    # --- MOVIE MODE ---
     if data.startswith("mov_"):
-        movie_id = data.split("_")[1]
-        movies_cache = context.user_data.get('search_results', {})
-        movie = movies_cache.get(movie_id)
+        mid = data.split("_")[1]
+        cache = context.user_data.get('search_results', {})
+        movie = cache.get(mid)
         
         if not movie:
-            await query.edit_message_text("❌ Data expired. Search again.")
+            await query.edit_message_text("❌ Session expired. Search again.")
             return
         
-        # Build Download Info
-        txt = f"🎬 **{movie['title']} ({movie['year']})**\n\n"
-        txt += f"⭐ Rating: {movie.get('rating')}/10\n"
-        txt += f"⏱ Duration: {movie.get('runtime')} min\n\n"
-        txt += "⬇️ **Download Links (Torrent/Magnet):**\n"
+        txt = f"🎬 **{movie['title']} ({movie['year']})**\n"
+        txt += f"⭐ {movie.get('rating')}/10 | ⏱ {movie.get('runtime')}m\n\n"
+        txt += "⬇️ **Download Links (Copy into Torrent App):**\n\n"
         
-        torrents = movie.get('torrents', [])
-        keyboard = []
-        
-        for t in torrents:
-            quality = t.get('quality')
-            size = t.get('size')
-            url = t.get('url') # .torrent file link
-            hash_val = t.get('hash')
+        for t in movie.get('torrents', []):
+            magnet = f"magnet:?xt=urn:btih:{t['hash']}&dn={movie['title']}&tr=udp://open.demonii.com:1337/announce"
+            txt += f"🔹 **{t['quality']}** ({t['size']})\n`{magnet}`\n\n"
             
-            # Create Magnet Link
-            magnet = f"magnet:?xt=urn:btih:{hash_val}&dn={movie['title']}&tr=udp://open.demonii.com:1337/announce"
-            
-            # Note: Bots can't upload magnets directly easily, so we give the .torrent URL or Text
-            txt += f"🔹 **{quality}** ({size})\nLink: `{url}`\n\n"
-            
-        await query.edit_message_text(txt, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        await query.edit_message_text(txt, parse_mode=ParseMode.MARKDOWN)
         return
 
-    # --- VIDEO DOWNLOAD HANDLER ---
+    # --- DOWNLOADER MODE ---
     url = context.user_data.get('url')
     if not url: return
 
-    quality = data
-    await query.edit_message_text(f"⚡ **Downloading...**\n⏳ Please wait...", parse_mode=ParseMode.MARKDOWN)
+    await query.edit_message_text(f"⚡ **Downloading...**\n⏳ Please wait...")
     
     loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(executor, run_downloader, url, quality)
+    result = await loop.run_in_executor(executor, run_downloader, url, data)
     
     if not result['status']:
-        await query.edit_message_text(f"❌ **Error:**\n`{result.get('error')[:200]}`", parse_mode=ParseMode.MARKDOWN)
+        await query.edit_message_text(f"❌ Error: {result.get('error')[:100]}")
         return
 
     path = result['path']
     size = os.path.getsize(path)
     
     if size > MAX_FILE_SIZE:
-        await query.edit_message_text(
-            f"❌ **File Too Big!**\nSize: `{get_readable_size(size)}`\nLimit: `{get_readable_size(MAX_FILE_SIZE)}`\n\n⚠️ Cloud Servers cannot upload >50MB."
-        )
+        await query.edit_message_text(f"❌ File too big ({get_readable_size(size)}). Limit: {get_readable_size(MAX_FILE_SIZE)}")
         os.remove(path)
         return
 
-    await query.edit_message_text(f"📤 **Uploading...**\n📦 Size: `{get_readable_size(size)}`")
+    await query.edit_message_text(f"📤 **Uploading...**\n📦 {get_readable_size(size)}")
     
     try:
         with open(path, 'rb') as f:
-            if quality == 'audio':
-                await context.bot.send_audio(
-                    chat_id=update.effective_chat.id, 
-                    audio=f, 
-                    title=result['title'],
-                    write_timeout=120
-                )
+            if data == 'audio':
+                await context.bot.send_audio(chat_id=update.effective_chat.id, audio=f, title=result['title'], write_timeout=120)
             else:
-                await context.bot.send_video(
-                    chat_id=update.effective_chat.id, 
-                    video=f, 
-                    caption=f"🎬 {result['title']}", 
-                    supports_streaming=True,
-                    write_timeout=120
-                )
+                await context.bot.send_video(chat_id=update.effective_chat.id, video=f, caption=result['title'], supports_streaming=True, write_timeout=120)
         await query.delete_message()
-    except Exception as e:
-        logger.error(f"Upload Error: {e}")
-        await query.edit_message_text("❌ Upload Failed (Server Timeout)")
+    except Exception:
+        await query.edit_message_text("❌ Upload Error.")
     finally:
         if os.path.exists(path): os.remove(path)
 
-# --- APP STARTUP ---
+# --- STARTUP ---
 async def main():
-    # Crash Proof Timeouts
     req = HTTPXRequest(connection_pool_size=10, read_timeout=60, write_timeout=60, connect_timeout=60)
-    
     app_bot = Application.builder().token(BOT_TOKEN).request(req).build()
 
-    # Handlers
     app_bot.add_handler(CommandHandler("start", start))
-    app_bot.add_handler(CommandHandler("search", search_handler)) # New Movie Feature
+    app_bot.add_handler(CommandHandler("search", search_handler))
     app_bot.add_handler(CommandHandler(["add", "remove"], admin_ops))
     app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     app_bot.add_handler(CallbackQueryHandler(button_callback))
