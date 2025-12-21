@@ -168,14 +168,14 @@ def find_streaming_link(url):
             href = a['href']
             
             # Keywords: hubcdn, hubcloud, hdstream, etc.
-            if any(x in href for x in ['hubcdn', 'hubcloud', 'hdstream', 'drive', 'file']):
+            if any(x in href for x in ['hubcdn', 'hubcloud', 'hdstream', 'drive', 'file', 'fans']):
                 if "http" in href:
                     label = f"▶️ {a.text.strip()[:30]}"
-                    if not label.strip(): label = "▶️ Stream Link"
+                    if not label.strip() or "Click" in label: label = "▶️ Stream Link"
                     if not any(s['url'] == href for s in stream_targets):
                         stream_targets.append({"label": label, "url": href})
         
-        # Also grab "Watch Online" buttons if they are generic links
+        # Also grab "Watch Online" buttons
         if not stream_targets:
             for a in all_links:
                 if "watch" in a.text.lower() or "stream" in a.text.lower():
@@ -187,73 +187,79 @@ def find_streaming_link(url):
         logger.error(f"Parse Error: {e}")
         return []
 
-# --- 3. CUSTOM LINK RESOLVER (THE FIX) ---
-def resolve_custom_stream(url):
+# --- 3. UNIVERSAL STREAM SNIFFER (The "Jad Se Khatam" Fix) ---
+def resolve_universal_stream(url):
     """
-    Extracts the REAL video file (.mp4/.m3u8) from hubcdn/hdstream.
+    Brute-force searches for .m3u8 or .mp4 links inside the target page.
+    This bypasses the need for yt-dlp to support the specific site.
     """
-    logger.info(f"🕵️ Resolving: {url}")
+    logger.info(f"🕵️ Sniffing URL: {url}")
     
-    # Common domains for this logic
-    target_hosts = ['hubcdn', 'hubcloud', 'hdstream', 'hubfiles']
-    if not any(h in url for h in target_hosts):
-        return url # Return original if not a target host
-
     session = requests.Session()
-    # Use generic headers, sometimes Referer is needed
+    # Use generic headers, pass Referer as the streaming site itself
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": TARGET_DOMAIN
     })
     
     try:
+        # 1. Fetch the HubCDN/Stream Page
         resp = session.get(url, timeout=15, allow_redirects=True)
         html = resp.text
-        final_url = resp.url # In case of redirects
         
-        # METHOD 1: Look for 'file' or 'source' in JavaScript
-        # HubCDN/Cloud often uses JWPlayer or similar
-        # Pattern: file: "https://....m3u8"
+        # 2. BRUTE FORCE REGEX: Look for ANY http link ending in .m3u8 or .mp4
+        # This catches "file:", "src:", "source:", or even hidden variables.
         
-        # Regex for .m3u8 or .mp4 inside quotes
-        patterns = [
-            r'file:\s*"([^"]+\.(?:m3u8|mp4))"',
-            r'source\s*:\s*"([^"]+\.(?:m3u8|mp4))"',
-            r'src\s*:\s*"([^"]+\.(?:m3u8|mp4))"',
-            r'sources\s*:\s*\[\s*{\s*file\s*:\s*"([^"]+)"',
-        ]
-        
-        for p in patterns:
-            match = re.search(p, html)
-            if match:
-                direct_link = match.group(1)
-                logger.info(f"✅ Found Direct Link: {direct_link}")
-                return direct_link
+        # Priority 1: HLS Stream (.m3u8) - Best for streaming
+        m3u8_matches = re.findall(r'(https?://[^"\s\']+\.m3u8)', html)
+        if m3u8_matches:
+            # Take the master/index one if possible, otherwise first one
+            for link in m3u8_matches:
+                if "master" in link or "index" in link:
+                    logger.info(f"✅ Found Master M3U8: {link}")
+                    return link
+            logger.info(f"✅ Found M3U8: {m3u8_matches[0]}")
+            return m3u8_matches[0]
 
-        # METHOD 2: Packed JavaScript (Common in HubCloud)
-        # Often code is packed like eval(function(p,a,c,k,e,d)...)
-        # This is hard to decode in Python without 'jsbeautifier' or 'unpacker'
-        # But sometimes the link is just sitting in a 'download' button
-        
-        dl_btn = re.search(r'href="([^"]+\.mp4)"', html)
-        if dl_btn:
-            return dl_btn.group(1)
+        # Priority 2: Direct Video (.mp4)
+        mp4_matches = re.findall(r'(https?://[^"\s\']+\.mp4)', html)
+        if mp4_matches:
+            logger.info(f"✅ Found MP4: {mp4_matches[0]}")
+            return mp4_matches[0]
 
-        logger.warning("❌ Could not extract direct link via Regex. Trying original URL with yt-dlp generic extractor.")
-        return final_url
+        # Priority 3: Fallback API (If regex fails completely)
+        # This uses an external service if our local sniffer fails
+        logger.warning("❌ Sniffer failed. Trying external API fallback...")
+        api_url = f"https://teraboxvideodownloader.nepcoderdevs.workers.dev/?url={url}"
+        api_resp = requests.get(api_url, timeout=10).json()
+        
+        # Check standard JSON location for links
+        if "response" in api_resp:
+             res = api_resp["response"]
+             if isinstance(res, list) and res:
+                 link = res[0].get("resolutions", {}).get("Fast Download")
+                 if link: return link
+
+        # If all fails, return None (So we don't pass bad URL to yt-dlp)
+        return None
         
     except Exception as e:
-        logger.error(f"Resolver Error: {e}")
-        return url
+        logger.error(f"Sniffer Error: {e}")
+        return None
 
 # --- 4. DOWNLOADER ENGINE ---
 def process_media_task(url, quality_setting):
     if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
     timestamp = int(time.time())
     
-    # STEP 1: RESOLVE URL (Fix for Unsupported URL)
-    final_url = resolve_custom_stream(url)
-    logger.info(f"⬇️ Passing to yt-dlp: {final_url}")
+    # STEP 1: SNIFF THE REAL LINK
+    # We NEVER pass the hubcdn URL to yt-dlp directly anymore.
+    final_url = resolve_universal_stream(url)
+    
+    if not final_url:
+        return {"status": False, "error": "Could not extract video stream. Site might be protected."}
+
+    logger.info(f"⬇️ Downloading Real Link: {final_url}")
 
     # Configure yt-dlp
     if quality_setting == '480':
@@ -274,9 +280,9 @@ def process_media_task(url, quality_setting):
         'noplaylist': True,
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
         'hls_prefer_native': True,
-        # Pass referer to yt-dlp just in case the direct link needs it
+        # Important: Pass the original page as referer, some m3u8 links need it
         'http_headers': {
-            'Referer': url # The page we extracted from
+            'Referer': url 
         }
     }
     
@@ -409,7 +415,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ ENV Error: GROUP_ID missing.")
             return
 
-        await query.edit_message_text(f"⬇️ **Downloading...**\nQuality: {qual}p\n\n(Wait ~2-5 mins)")
+        await query.edit_message_text(f"⬇️ **Downloading...**\nQuality: {qual}p\n\n(Scanning for hidden video file...)")
         
         loop = asyncio.get_running_loop()
         res = await loop.run_in_executor(executor, process_media_task, url, qual)
@@ -477,3 +483,4 @@ def webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+    
