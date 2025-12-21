@@ -23,10 +23,7 @@ try:
 except:
     OWNER_ID = 0
 
-# New: Group ID where movie will be uploaded
-# Example: -1001234567890
 TELEGRAM_GROUP_ID = os.getenv("GROUP_ID") 
-
 COOKIES_ENV = os.getenv("COOKIES_CONTENT")
 TARGET_DOMAIN = os.getenv("WEBSITE_URL", "https://hdhub4u.rehab").rstrip("/")
 
@@ -76,7 +73,6 @@ def setup_cookies():
 setup_cookies()
 
 app = Flask(__name__)
-# High workers for downloading
 executor = ThreadPoolExecutor(max_workers=4)
 
 # --- UTILS ---
@@ -96,7 +92,7 @@ async def check_auth(update: Update):
         return False
     return True
 
-# --- NETWORK ENGINE ---
+# --- NETWORK HEADER ENGINE ---
 def get_headers(referer=None):
     head = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -119,11 +115,10 @@ def get_cookies_dict():
         except: pass
     return cookies
 
-# --- 1. SMART SEARCH ---
+# --- 1. SEARCH ---
 def search_website(query):
     search_url = f"{TARGET_DOMAIN}/?s={query.replace(' ', '+')}"
     logger.info(f"🔎 Searching: {search_url}")
-    
     try:
         session = requests.Session()
         session.headers.update(get_headers(TARGET_DOMAIN))
@@ -132,19 +127,13 @@ def search_website(query):
         resp = session.get(search_url, timeout=15)
         soup = BeautifulSoup(resp.text, 'lxml')
         results = []
-        
-        # Select all potential movie containers
         candidates = soup.select('ul.recent-movies li, article.post, div.result-item')
         
         query_words = query.lower().split()
-        
         for item in candidates:
             a_tag = item.find('a')
             if not a_tag: continue
-            
             url = a_tag.get('href')
-            
-            # Title extraction
             title = ""
             if item.find('figcaption'): title = item.find('figcaption').text.strip()
             elif a_tag.get('title'): title = a_tag.get('title')
@@ -152,23 +141,18 @@ def search_website(query):
             
             if not url or not title: continue
             
-            # Relevance Filter
             if any(w in title.lower() for w in query_words):
                 clean_title = title.replace("Download", "").replace("Full Movie", "").strip()
                 results.append({"title": clean_title, "url": url})
                 if len(results) >= 8: break
-        
         return results
     except Exception as e:
         logger.error(f"Search Error: {e}")
         return []
 
-# --- 2. FIND STREAMING LINKS ---
+# --- 2. FIND STREAMS ---
 def find_streaming_link(url):
-    """
-    Parses the movie page to find 'Watch Online' or 'Stream' section.
-    """
-    logger.info(f"📂 Parsing for Stream: {url}")
+    logger.info(f"📂 Parsing: {url}")
     try:
         session = requests.Session()
         session.headers.update(get_headers(TARGET_DOMAIN))
@@ -176,9 +160,6 @@ def find_streaming_link(url):
         
         resp = session.get(url, timeout=20)
         soup = BeautifulSoup(resp.text, 'lxml')
-        
-        # Logic: Find links that say "Watch Online", "Stream", "Instant"
-        # usually below download links
         stream_targets = []
         
         all_links = soup.find_all('a', href=True)
@@ -186,15 +167,13 @@ def find_streaming_link(url):
             text = a.text.lower()
             href = a['href']
             
-            # Keywords for streaming
-            if "watch" in text or "online" in text or "stream" in text or "hubcloud" in href or "embed" in href:
+            if "watch" in text or "online" in text or "stream" in text or "hubcloud" in href or "hdstream" in href or "file" in href:
                 if "http" in href and "category" not in href:
                     label = f"▶️ {a.text.strip()[:30]}"
                     if not any(s['url'] == href for s in stream_targets):
                         stream_targets.append({"label": label, "url": href})
         
-        # If no explicit stream links, grab the standard download links too
-        # because yt-dlp can stream from download links often
+        # Fallback to download links if no stream link found
         if not stream_targets:
             for a in all_links:
                 if "720p" in a.text or "1080p" in a.text:
@@ -203,39 +182,65 @@ def find_streaming_link(url):
 
         return stream_targets
     except Exception as e:
-        logger.error(f"Stream Parse Error: {e}")
+        logger.error(f"Parse Error: {e}")
         return []
 
-# --- 3. DOWNLOAD & UPLOAD ENGINE ---
+# --- 3. CUSTOM LINK RESOLVER (Fixes 'Unsupported URL') ---
+def resolve_custom_stream(url):
+    """
+    Extracts the REAL video file (.mp4/.m3u8) from hosting sites like hdstream4u.
+    """
+    logger.info(f"🕵️ Resolving: {url}")
+    session = requests.Session()
+    session.headers.update(get_headers())
+    
+    try:
+        # Case 1: HDStream4u / HubCloud
+        if "hdstream4u" in url or "hubcloud" in url:
+            resp = session.get(url, timeout=15)
+            html = resp.text
+            
+            # Look for .m3u8 or .mp4 inside scripts
+            # Pattern: file: "https://...m3u8"
+            match = re.search(r'file:\s*"([^"]+\.(?:m3u8|mp4))"', html)
+            if match:
+                return match.group(1)
+            
+            # Pattern 2: source src="..."
+            match2 = re.search(r'source src="([^"]+)"', html)
+            if match2:
+                return match2.group(1)
+                
+            # Pattern 3: window.location (Redirects)
+            if "window.location.replace" in html:
+                 match3 = re.search(r'window\.location\.replace\("([^"]+)"\)', html)
+                 if match3:
+                     return match3.group(1)
+
+        # Return original if no special handling needed or found
+        return url
+        
+    except Exception as e:
+        logger.error(f"Resolver Error: {e}")
+        return url
+
+# --- 4. DOWNLOADER ENGINE ---
 def process_media_task(url, quality_setting):
-    """
-    Downloads media and Uploads to Group.
-    quality_setting: 'best', '720', '480'
-    """
     if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
     timestamp = int(time.time())
     
-    # 1. Resolve Landing Page (Bypass)
-    # Most stream links are wrappers. We need the final URL.
-    try:
-        session = requests.Session()
-        session.headers.update(get_headers(TARGET_DOMAIN))
-        session.cookies.update(get_cookies_dict())
-        # Follow redirects to get real URL
-        final_url = session.get(url, allow_redirects=True, timeout=15).url
-    except:
-        final_url = url
+    # STEP 1: RESOLVE URL (Fix for Unsupported URL)
+    final_url = resolve_custom_stream(url)
+    logger.info(f"⬇️ Downloading: {final_url}")
 
-    logger.info(f"⬇️ Downloading from: {final_url} | Quality: {quality_setting}")
-
-    # 2. Configure yt-dlp for Size Control
-    # We use format selection to control size/quality
+    # Configure yt-dlp
+    # For HLS (m3u8), we need ffmpeg. Render has ffmpeg pre-installed usually.
     if quality_setting == '480':
         fmt = 'bestvideo[height<=480]+bestaudio/best[height<=480]/best'
     elif quality_setting == '720':
         fmt = 'bestvideo[height<=720]+bestaudio/best[height<=720]/best'
     else:
-        fmt = 'best' # Max quality
+        fmt = 'best'
 
     filename_template = f'{DOWNLOAD_DIR}/movie_{timestamp}.%(ext)s'
 
@@ -246,31 +251,30 @@ def process_media_task(url, quality_setting):
         'no_warnings': True,
         'geo_bypass': True,
         'noplaylist': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
+        # HLS options
+        'hls_prefer_native': True,
     }
     
     if os.path.exists(COOKIE_FILE): opts['cookiefile'] = COOKIE_FILE
 
     try:
-        # DOWNLOAD
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(final_url, download=True)
             fpath = ydl.prepare_filename(info)
             
-            # Correction if merged
+            # Handle potential extension changes after merge
             base, _ = os.path.splitext(fpath)
-            if not os.path.exists(fpath) and os.path.exists(base+".mp4"):
-                fpath = base+".mp4"
-            elif not os.path.exists(fpath) and os.path.exists(base+".mkv"):
-                fpath = base+".mkv"
+            for ext in ['.mp4', '.mkv', '.webm']:
+                if os.path.exists(base + ext):
+                    fpath = base + ext
+                    break
 
             if not os.path.exists(fpath):
-                return {"status": False, "error": "Download failed (File not found)"}
+                return {"status": False, "error": "File not found after download."}
 
-            # Size Check (Telegram Limit)
             fsize = os.path.getsize(fpath)
             
-            # NOTE: Render Free cannot re-encode. We just check size.
             return {
                 "status": True,
                 "path": fpath,
@@ -286,20 +290,9 @@ def process_media_task(url, quality_setting):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update): return
-    
-    grp_status = "✅ Connected" if TELEGRAM_GROUP_ID else "⚠️ Not Set (Check ENV)"
-    
-    txt = (
-        f"👋 **Stream-to-Group Bot!**\n"
-        f"📂 Group: {grp_status}\n\n"
-        "🎬 **How to use:**\n"
-        "1. `/search MovieName`\n"
-        "2. Select Movie\n"
-        "3. Select Stream Source\n"
-        "4. Choose Quality (Low = Small Size)\n"
-        "5. Bot uploads to Group!"
-    )
-    if update.effective_user.id == OWNER_ID: txt += "\n\n👮‍♂️ `/add`, `/remove`"
+    grp = "✅ Set" if TELEGRAM_GROUP_ID else "⚠️ Missing"
+    txt = f"👋 **Stream Bot!**\n📂 Group: {grp}\n\n`/search MovieName`"
+    if update.effective_user.id == OWNER_ID: txt += "\n\n👮‍♂️ Admin: `/add`"
     await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
 
 async def admin_ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -313,15 +306,14 @@ async def admin_ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Done")
     except: await update.message.reply_text("Usage: `/add 12345`")
 
-# 1. SEARCH
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update): return
     if not context.args:
-        await update.message.reply_text("❌ Usage: `/search Kalki`")
+        await update.message.reply_text("❌ Usage: `/search Pathaan`")
         return
     
     query = " ".join(context.args)
-    await update.message.reply_text(f"🔍 Searching: `{query}`...")
+    await update.message.reply_text(f"🔍 Searching `{query}`...")
     
     loop = asyncio.get_running_loop()
     results = await loop.run_in_executor(executor, search_website, query)
@@ -331,129 +323,106 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     context.user_data['search_res'] = results
-    keyboard = []
-    for idx, movie in enumerate(results):
-        keyboard.append([InlineKeyboardButton(f"🎬 {movie['title']}", callback_data=f"sel_{idx}")])
+    kb = []
+    for idx, m in enumerate(results):
+        kb.append([InlineKeyboardButton(f"🎬 {m['title']}", callback_data=f"sel_{idx}")])
         
-    await update.message.reply_text(f"✅ Found {len(results)} movies:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(f"✅ Found {len(results)}:", reply_markup=InlineKeyboardMarkup(kb))
 
-# 2. SELECT MOVIE -> FIND STREAMS
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
     
-    # A. Movie Selected
+    # 1. MOVIE SELECTED
     if data.startswith("sel_"):
         idx = int(data.split("_")[1])
         results = context.user_data.get('search_res', [])
         if idx >= len(results): return
         
         movie = results[idx]
-        await query.edit_message_text(f"🔄 Fetching Stream Links for:\n**{movie['title']}**...")
+        await query.edit_message_text(f"🔄 Finding Streams for:\n**{movie['title']}**...")
         
         loop = asyncio.get_running_loop()
         streams = await loop.run_in_executor(executor, find_streaming_link, movie['url'])
         
         if not streams:
-            await query.edit_message_text("❌ No Streaming/Watch Online links found.")
+            await query.edit_message_text("❌ No streams found.")
             return
         
         context.user_data['streams'] = streams
-        context.user_data['movie_title'] = movie['title']
+        context.user_data['m_title'] = movie['title']
         
-        keyboard = []
+        kb = []
         for i, s in enumerate(streams):
-            keyboard.append([InlineKeyboardButton(s['label'], callback_data=f"stm_{i}")])
-            
-        await query.edit_message_text("👇 Select Source:", reply_markup=InlineKeyboardMarkup(keyboard))
+            kb.append([InlineKeyboardButton(s['label'], callback_data=f"stm_{i}")])
+        await query.edit_message_text("👇 Select Source:", reply_markup=InlineKeyboardMarkup(kb))
         return
 
-    # B. Source Selected -> Choose Quality (Size Control)
+    # 2. SOURCE SELECTED
     if data.startswith("stm_"):
         idx = int(data.split("_")[1])
         streams = context.user_data.get('streams', [])
         if idx >= len(streams): return
         
-        selected_stream = streams[idx]
-        context.user_data['target_url'] = selected_stream['url']
+        context.user_data['t_url'] = streams[idx]['url']
         
-        # Quality Selection Menu
         kb = [
-            [InlineKeyboardButton("📱 480p (Small Size)", callback_data="q_480")],
-            [InlineKeyboardButton("🎥 720p (Medium)", callback_data="q_720")],
-            [InlineKeyboardButton("💎 Best Quality (Large)", callback_data="q_best")]
+            [InlineKeyboardButton("📱 480p", callback_data="q_480")],
+            [InlineKeyboardButton("🎥 720p", callback_data="q_720")],
+            [InlineKeyboardButton("💎 Best", callback_data="q_best")]
         ]
-        await query.edit_message_text(f"⚙️ Select Quality for:\n{selected_stream['label']}\n\n(Lower quality = Faster Upload)", reply_markup=InlineKeyboardMarkup(kb))
+        await query.edit_message_text(f"⚙️ Select Quality for:\n{streams[idx]['label']}", reply_markup=InlineKeyboardMarkup(kb))
         return
 
-    # C. Quality Selected -> Download & Upload
+    # 3. DOWNLOAD & UPLOAD
     if data.startswith("q_"):
-        quality = data.split("_")[1]
-        url = context.user_data.get('target_url')
-        title = context.user_data.get('movie_title', 'Movie')
+        qual = data.split("_")[1]
+        url = context.user_data.get('t_url')
+        title = context.user_data.get('m_title', 'Movie')
         
         if not TELEGRAM_GROUP_ID:
-            await query.edit_message_text("❌ Error: Group ID not set in Environment Variables.")
+            await query.edit_message_text("❌ ENV Error: GROUP_ID missing.")
             return
 
-        await query.edit_message_text(f"⬇️ **Downloading...**\nQuality: {quality}p\nTitle: {title}\n\n(This may take time, please wait...)")
+        await query.edit_message_text(f"⬇️ **Downloading...**\nQuality: {qual}p\n\n(Wait ~2-5 mins)")
         
         loop = asyncio.get_running_loop()
-        # Run heavy task
-        result = await loop.run_in_executor(executor, process_media_task, url, quality)
+        res = await loop.run_in_executor(executor, process_media_task, url, qual)
         
-        if not result['status']:
-            await query.edit_message_text(f"❌ Download Failed:\n`{result.get('error')}`", parse_mode=ParseMode.MARKDOWN)
+        if not res['status']:
+            await query.edit_message_text(f"❌ Error:\n`{res.get('error')}`", parse_mode=ParseMode.MARKDOWN)
             return
             
-        fpath = result['path']
-        fsize = result['size']
+        fpath = res['path']
+        fsize = res['size']
         
-        # TELEGRAM LIMIT CHECK
-        # Standard Bot: 50MB (approx 52428800 bytes)
-        # Local API: 2GB
-        LIMIT = 49 * 1024 * 1024 # Safe limit for standard bot
-        
-        if fsize > LIMIT:
-            await query.edit_message_text(
-                f"❌ **Upload Failed!**\n"
-                f"📁 File Size: `{get_readable_size(fsize)}`\n"
-                f"⛔ Telegram Limit: 50MB\n\n"
-                "Cloud server cannot upload large files without Local API.\n"
-                "Try selecting '480p' quality."
-            )
+        # 50MB Limit Check (Telegram Bot API Limit)
+        if fsize > 49 * 1024 * 1024:
+            await query.edit_message_text(f"❌ File too big ({get_readable_size(fsize)}).\nTelegram Bot limit is 50MB.\nTry 480p or shorter video.")
             os.remove(fpath)
             return
 
         await query.edit_message_text(f"📤 **Uploading to Group...**\nSize: {get_readable_size(fsize)}")
         
         try:
-            # Upload to Group
             with open(fpath, 'rb') as f:
                 await context.bot.send_video(
                     chat_id=TELEGRAM_GROUP_ID,
                     video=f,
-                    caption=f"🎬 **{title}**\n💿 Quality: {quality}p\n🤖 Uploaded by Bot",
-                    width=1280 if quality=='720' else 854,
-                    height=720 if quality=='720' else 480,
-                    duration=result.get('duration'),
+                    caption=f"🎬 **{title}**\n💿 Quality: {qual}p",
                     supports_streaming=True,
-                    write_timeout=300, # 5 min timeout for upload
-                    read_timeout=300
+                    read_timeout=300, write_timeout=300
                 )
-            
-            await query.edit_message_text("✅ **Successfully Uploaded to Group!**")
-            
+            await query.edit_message_text("✅ Sent to Group!")
         except Exception as e:
             logger.error(f"Upload Error: {e}")
-            await query.edit_message_text("❌ Error sending to group. (Timeout or Permission issue)")
+            await query.edit_message_text("❌ Upload Failed.")
         finally:
             if os.path.exists(fpath): os.remove(fpath)
 
 # --- STARTUP ---
 async def main():
-    # High timeouts for large file uploads
     req = HTTPXRequest(connection_pool_size=10, read_timeout=300, write_timeout=300, connect_timeout=60)
     app_bot = Application.builder().token(BOT_TOKEN).request(req).build()
 
@@ -484,4 +453,3 @@ def webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-            
