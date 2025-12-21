@@ -6,7 +6,6 @@ import sys
 import ujson as json
 import requests
 import re
-import cloudscraper
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request
@@ -93,11 +92,26 @@ async def check_auth(update: Update):
         return False
     return True
 
-# --- SCRAPER INSTANCE ---
-def get_scraper():
-    return cloudscraper.create_scraper(
-        browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
-    )
+# --- ROBUST NETWORK ENGINE ---
+def get_fake_headers(referer=None):
+    """Generates headers that mimic a real PC Chrome browser perfectly."""
+    head = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+    }
+    if referer:
+        head["Referer"] = referer
+        head["Sec-Fetch-Site"] = "same-origin"
+    return head
 
 def get_cookies_dict():
     cookies = {}
@@ -117,8 +131,11 @@ def search_website(query):
     search_url = f"{TARGET_DOMAIN}/?s={query.replace(' ', '+')}"
     logger.info(f"🔎 Searching: {search_url}")
     try:
-        scraper = get_scraper()
-        resp = scraper.get(search_url, timeout=20)
+        session = requests.Session()
+        session.headers.update(get_fake_headers(TARGET_DOMAIN))
+        session.cookies.update(get_cookies_dict())
+        
+        resp = session.get(search_url, timeout=15)
         soup = BeautifulSoup(resp.text, 'lxml')
         results = []
         candidates = soup.select('ul.recent-movies li, article.post, div.result-item')
@@ -148,8 +165,11 @@ def search_website(query):
 def find_streaming_link(url):
     logger.info(f"📂 Parsing: {url}")
     try:
-        scraper = get_scraper()
-        resp = scraper.get(url, timeout=20)
+        session = requests.Session()
+        session.headers.update(get_fake_headers(TARGET_DOMAIN))
+        session.cookies.update(get_cookies_dict())
+        
+        resp = session.get(url, timeout=20)
         soup = BeautifulSoup(resp.text, 'lxml')
         stream_targets = []
         
@@ -158,7 +178,7 @@ def find_streaming_link(url):
             text = a.text.lower()
             href = a['href']
             
-            # Keywords
+            # Smart Keyword Match
             if any(x in href for x in ['hubcdn', 'hubcloud', 'hdstream', 'drive', 'file', 'fans', 'wish']):
                 if "http" in href:
                     label = f"▶️ {a.text.strip()[:30]}"
@@ -177,7 +197,7 @@ def find_streaming_link(url):
         logger.error(f"Parse Error: {e}")
         return []
 
-# --- 3. HYBRID DECRYPTER (The Fix for text 2.txt) ---
+# --- 3. UNIVERSAL DECRYPTER (No Cloudscraper) ---
 def is_valid_url(url):
     if not url: return False
     if not url.startswith("http"): return False
@@ -187,57 +207,67 @@ def is_valid_url(url):
 
 def resolve_hubcdn_logic(url):
     """
-    Decryption logic updated for HubCDN Packed JS.
-    Returns: (final_url, use_generic_extractor_flag)
+    Decryption logic using Requests + Headers + Fallback API.
     """
-    logger.info(f"🕵️ Analyzing: {url}")
-    scraper = get_scraper()
+    logger.info(f"🕵️ Decrypting: {url}")
+    
+    session = requests.Session()
+    # Critical: Referer must be the URL itself for HubCDN
+    session.headers.update(get_fake_headers(url))
     
     try:
-        # Step 1: Get the HTML
-        resp = scraper.get(url, timeout=15, allow_redirects=True)
+        # Step 1: Get HTML
+        resp = session.get(url, timeout=15, allow_redirects=True)
         html = resp.text
         
-        # Step 2: Try finding CLEAN .m3u8 links first
-        m3u8_patterns = [
+        # Step 2: Regex for clean M3U8/MP4
+        patterns = [
             r'file\s*:\s*["\'](https?://[^"\']+\.m3u8[^"\']*)["\']',
-            r'source\s*:\s*["\'](https?://[^"\']+\.m3u8[^"\']*)["\']',
+            r'source\s*:\s*["\'](https?://[^"\']+\.mp4[^"\']*)["\']',
             r'src\s*:\s*["\'](https?://[^"\']+\.m3u8[^"\']*)["\']',
             r'["\'](https?://[^"\']+\.m3u8[^"\']*)["\']'
         ]
         
-        for p in m3u8_patterns:
+        for p in patterns:
             matches = re.findall(p, html)
             for m in matches:
                 if is_valid_url(m):
-                    logger.info(f"✅ Found Direct M3U8: {m}")
-                    return m, False # Link found, strict mode
+                    logger.info(f"✅ Found Direct Link: {m}")
+                    return m, False # False = Not generic mode
 
-        # Step 3: Try finding MP4
-        mp4_patterns = [
-            r'file\s*:\s*["\'](https?://[^"\']+\.mp4[^"\']*)["\']',
-            r'src\s*:\s*["\'](https?://[^"\']+\.mp4[^"\']*)["\']',
-            r'["\'](https?://[^"\']+\.mp4[^"\']*)["\']'
-        ]
-        
-        for p in mp4_patterns:
-            matches = re.findall(p, html)
-            for m in matches:
-                if is_valid_url(m):
-                    logger.info(f"✅ Found Direct MP4: {m}")
-                    return m, False
+        # Step 3: Check for Obfuscated/Hidden inputs
+        # Sometimes hidden in <input id="link" value="...">
+        soup = BeautifulSoup(html, 'lxml')
+        hidden_inputs = soup.find_all('input', type='hidden')
+        for inp in hidden_inputs:
+            val = inp.get('value', '')
+            if is_valid_url(val) and (".mp4" in val or ".m3u8" in val):
+                return val, False
 
-        # Step 4: FALLBACK - FORCE GENERIC
-        # Since we saw obfuscated code in text 2.txt ($("1j[6u=76]")), 
-        # we know regex might fail.
-        # We pass the PAGE URL to yt-dlp and tell it to figure it out.
-        
-        logger.warning("⚠️ No regex match in obfuscated code. Falling back to Generic Extractor.")
-        return url, True # Force Generic = True
+        # Step 4: EXTERNAL API FALLBACK (If Bot Fails)
+        # We assume if regex failed, site is heavily protected.
+        # Use a public API helper (like NepCoder) that runs headless browsers.
+        logger.info("⚠️ Regex failed. Trying External API Fallback...")
+        try:
+            api_url = f"https://teraboxvideodownloader.nepcoderdevs.workers.dev/?url={url}"
+            api_resp = requests.get(api_url, timeout=10).json()
+            if "response" in api_resp:
+                 res = api_resp["response"]
+                 if isinstance(res, list) and res:
+                     link = res[0].get("resolutions", {}).get("Fast Download")
+                     if is_valid_url(link):
+                         logger.info("✅ External API Success")
+                         return link, False
+        except:
+            pass
+
+        # Step 5: Force Generic as Last Resort
+        # If everything fails, give the original URL to yt-dlp's generic extractor
+        logger.warning("⚠️ All methods failed. Forcing Generic Mode.")
+        return url, True
 
     except Exception as e:
         logger.error(f"Decryption Error: {e}")
-        # Even if error, try generic as last resort
         return url, True
 
 # --- 4. DOWNLOAD ENGINE ---
@@ -249,9 +279,9 @@ def process_media_task(url, quality_setting):
     final_url, use_generic = resolve_hubcdn_logic(url)
     
     if not final_url:
-        return {"status": False, "error": "Could not extract video stream."}
+        return {"status": False, "error": "Extraction failed completely."}
 
-    logger.info(f"⬇️ Downloading: {final_url} (Generic Mode: {use_generic})")
+    logger.info(f"⬇️ Downloading: {final_url} (Generic: {use_generic})")
 
     # Configure yt-dlp
     if quality_setting == '480':
@@ -272,7 +302,6 @@ def process_media_task(url, quality_setting):
         'noplaylist': True,
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/123.0.0.0 Safari/537.36',
         'hls_prefer_native': True,
-        # IMPORTANT: Referer is critical for HubCDN
         'http_headers': {
             'Referer': url,
             'Origin': '/'.join(url.split('/')[:3])
@@ -280,17 +309,14 @@ def process_media_task(url, quality_setting):
     }
     
     if use_generic:
-        # This tells yt-dlp to ignore "Unsupported URL" and try to parse the page anyway
         opts['force_generic_extractor'] = True
         opts['nocheckcertificate'] = True
-        # Sometimes header check fails on generic, allow it
         opts['ignoreerrors'] = True 
 
     if os.path.exists(COOKIE_FILE): opts['cookiefile'] = COOKIE_FILE
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            # If using generic mode, final_url is the page url
             info = ydl.extract_info(final_url, download=True)
             fpath = ydl.prepare_filename(info)
             
@@ -301,7 +327,7 @@ def process_media_task(url, quality_setting):
                     break
 
             if not os.path.exists(fpath):
-                return {"status": False, "error": "File not found after download (yt-dlp failed)."}
+                return {"status": False, "error": "File not found after download."}
 
             fsize = os.path.getsize(fpath)
             
@@ -321,7 +347,7 @@ def process_media_task(url, quality_setting):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update): return
     grp = "✅ Set" if TELEGRAM_GROUP_ID else "⚠️ Missing"
-    txt = f"👋 **Stream Bot (Hybrid Fix)**\n📂 Group: {grp}\n\n`/search MovieName`"
+    txt = f"👋 **Stream Bot (Crash Proof)**\n📂 Group: {grp}\n\n`/search MovieName`"
     if update.effective_user.id == OWNER_ID: txt += "\n\n👮‍♂️ Admin: `/add`"
     await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
 
@@ -412,7 +438,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ ENV Error: GROUP_ID missing.")
             return
 
-        await query.edit_message_text(f"⬇️ **Downloading...**\nQuality: {qual}p\n\n(Bypassing Javascript Protection...)")
+        await query.edit_message_text(f"⬇️ **Downloading...**\nQuality: {qual}p\n\n(Decrypting & Downloading...)")
         
         loop = asyncio.get_running_loop()
         res = await loop.run_in_executor(executor, process_media_task, url, qual)
