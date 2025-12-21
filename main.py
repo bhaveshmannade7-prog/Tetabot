@@ -6,6 +6,7 @@ import sys
 import ujson as json
 import requests
 import re
+import cloudscraper # NEW: Anti-Bot Bypass
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request
@@ -92,15 +93,16 @@ async def check_auth(update: Update):
         return False
     return True
 
-# --- NETWORK HEADER ENGINE ---
-def get_headers(referer=None):
-    head = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Upgrade-Insecure-Requests": "1",
-    }
-    if referer: head["Referer"] = referer
-    return head
+# --- ADVANCED NETWORK ENGINE (CloudScraper) ---
+def get_scraper():
+    """Returns a CloudScraper instance that mimics a real browser."""
+    return cloudscraper.create_scraper(
+        browser={
+            'browser': 'chrome',
+            'platform': 'windows',
+            'desktop': True
+        }
+    )
 
 def get_cookies_dict():
     cookies = {}
@@ -120,11 +122,8 @@ def search_website(query):
     search_url = f"{TARGET_DOMAIN}/?s={query.replace(' ', '+')}"
     logger.info(f"🔎 Searching: {search_url}")
     try:
-        session = requests.Session()
-        session.headers.update(get_headers(TARGET_DOMAIN))
-        session.cookies.update(get_cookies_dict())
-        
-        resp = session.get(search_url, timeout=15)
+        scraper = get_scraper()
+        resp = scraper.get(search_url, timeout=20)
         soup = BeautifulSoup(resp.text, 'lxml')
         results = []
         candidates = soup.select('ul.recent-movies li, article.post, div.result-item')
@@ -154,11 +153,8 @@ def search_website(query):
 def find_streaming_link(url):
     logger.info(f"📂 Parsing: {url}")
     try:
-        session = requests.Session()
-        session.headers.update(get_headers(TARGET_DOMAIN))
-        session.cookies.update(get_cookies_dict())
-        
-        resp = session.get(url, timeout=20)
+        scraper = get_scraper()
+        resp = scraper.get(url, timeout=20)
         soup = BeautifulSoup(resp.text, 'lxml')
         stream_targets = []
         
@@ -167,15 +163,14 @@ def find_streaming_link(url):
             text = a.text.lower()
             href = a['href']
             
-            # Keywords: hubcdn, hubcloud, hdstream, etc.
-            if any(x in href for x in ['hubcdn', 'hubcloud', 'hdstream', 'drive', 'file', 'fans']):
+            # Smart Keywords for streaming sources
+            if any(x in href for x in ['hubcdn', 'hubcloud', 'hdstream', 'drive', 'file', 'fans', 'wish']):
                 if "http" in href:
                     label = f"▶️ {a.text.strip()[:30]}"
                     if not label.strip() or "Click" in label: label = "▶️ Stream Link"
                     if not any(s['url'] == href for s in stream_targets):
                         stream_targets.append({"label": label, "url": href})
         
-        # Also grab "Watch Online" buttons
         if not stream_targets:
             for a in all_links:
                 if "watch" in a.text.lower() or "stream" in a.text.lower():
@@ -187,65 +182,60 @@ def find_streaming_link(url):
         logger.error(f"Parse Error: {e}")
         return []
 
-# --- 3. UNIVERSAL STREAM SNIFFER (The "Jad Se Khatam" Fix) ---
+# --- 3. ADVANCED DECODER (Brute Force) ---
 def resolve_universal_stream(url):
     """
-    Brute-force searches for .m3u8 or .mp4 links inside the target page.
-    This bypasses the need for yt-dlp to support the specific site.
+    Advanced Logic to bypass HubCDN/HubCloud protection.
     """
-    logger.info(f"🕵️ Sniffing URL: {url}")
+    logger.info(f"🕵️ Deep Sniffing: {url}")
     
-    session = requests.Session()
-    # Use generic headers, pass Referer as the streaming site itself
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": TARGET_DOMAIN
-    })
+    scraper = get_scraper()
     
     try:
-        # 1. Fetch the HubCDN/Stream Page
-        resp = session.get(url, timeout=15, allow_redirects=True)
+        # Step 1: Visit the page with CloudScraper (Handles basic JS challenges)
+        resp = scraper.get(url, timeout=15, allow_redirects=True)
         html = resp.text
-        
-        # 2. BRUTE FORCE REGEX: Look for ANY http link ending in .m3u8 or .mp4
-        # This catches "file:", "src:", "source:", or even hidden variables.
-        
-        # Priority 1: HLS Stream (.m3u8) - Best for streaming
-        m3u8_matches = re.findall(r'(https?://[^"\s\']+\.m3u8)', html)
-        if m3u8_matches:
-            # Take the master/index one if possible, otherwise first one
-            for link in m3u8_matches:
-                if "master" in link or "index" in link:
-                    logger.info(f"✅ Found Master M3U8: {link}")
-                    return link
-            logger.info(f"✅ Found M3U8: {m3u8_matches[0]}")
-            return m3u8_matches[0]
+        current_url = resp.url
 
-        # Priority 2: Direct Video (.mp4)
-        mp4_matches = re.findall(r'(https?://[^"\s\']+\.mp4)', html)
+        # Step 2: BRUTE FORCE SEARCH for M3U8/MP4
+        # We search inside the entire HTML, including inside <script> tags
+        
+        # Pattern A: Standard m3u8
+        matches = re.findall(r'(https?://[^"\s\'<>]+\.m3u8)', html)
+        if matches:
+            # Filter out junk
+            for m in matches:
+                if "master" in m or "index" in m or "hls" in m:
+                    logger.info(f"✅ Found Master M3U8: {m}")
+                    return m, None # Direct link found
+            return matches[0], None
+
+        # Pattern B: MP4 files
+        mp4_matches = re.findall(r'(https?://[^"\s\'<>]+\.mp4)', html)
         if mp4_matches:
-            logger.info(f"✅ Found MP4: {mp4_matches[0]}")
-            return mp4_matches[0]
+            return mp4_matches[0], None
 
-        # Priority 3: Fallback API (If regex fails completely)
-        # This uses an external service if our local sniffer fails
-        logger.warning("❌ Sniffer failed. Trying external API fallback...")
-        api_url = f"https://teraboxvideodownloader.nepcoderdevs.workers.dev/?url={url}"
-        api_resp = requests.get(api_url, timeout=10).json()
-        
-        # Check standard JSON location for links
-        if "response" in api_resp:
-             res = api_resp["response"]
-             if isinstance(res, list) and res:
-                 link = res[0].get("resolutions", {}).get("Fast Download")
-                 if link: return link
+        # Step 3: Handle "Click to Verify" / Redirect pages
+        # If no video found, check if it's an intermediate page
+        if "hubcloud" in current_url:
+            # Look for the 'Download' or 'Play' button link
+            # HubCloud often hides the real link in a button with specific classes
+            soup = BeautifulSoup(html, 'lxml')
+            btn = soup.find('a', class_='btn') # Generic check
+            if btn and btn.get('href') and "http" in btn['href']:
+                # Recursively check the next link
+                logger.info("Found intermediate button, following...")
+                return resolve_universal_stream(btn['href'])
 
-        # If all fails, return None (So we don't pass bad URL to yt-dlp)
-        return None
+        # Step 4: FALLBACK to GENERIC
+        # If we reached here, we couldn't find a direct link, BUT yt-dlp might be able to.
+        # We return the Page URL but signal to use Generic Extractor
+        logger.warning("⚠️ No direct link found in HTML. Passing Page URL to yt-dlp Generic.")
+        return current_url, "generic"
         
     except Exception as e:
         logger.error(f"Sniffer Error: {e}")
-        return None
+        return url, "generic"
 
 # --- 4. DOWNLOADER ENGINE ---
 def process_media_task(url, quality_setting):
@@ -253,13 +243,8 @@ def process_media_task(url, quality_setting):
     timestamp = int(time.time())
     
     # STEP 1: SNIFF THE REAL LINK
-    # We NEVER pass the hubcdn URL to yt-dlp directly anymore.
-    final_url = resolve_universal_stream(url)
-    
-    if not final_url:
-        return {"status": False, "error": "Could not extract video stream. Site might be protected."}
-
-    logger.info(f"⬇️ Downloading Real Link: {final_url}")
+    final_url, mode = resolve_universal_stream(url)
+    logger.info(f"⬇️ Downloading: {final_url} (Mode: {mode})")
 
     # Configure yt-dlp
     if quality_setting == '480':
@@ -278,13 +263,18 @@ def process_media_task(url, quality_setting):
         'no_warnings': True,
         'geo_bypass': True,
         'noplaylist': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
+        # SPOOFING A REAL BROWSER IS CRITICAL
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'hls_prefer_native': True,
-        # Important: Pass the original page as referer, some m3u8 links need it
         'http_headers': {
             'Referer': url 
         }
     }
+    
+    # Force Generic Extractor if sniffer failed but returned URL
+    if mode == "generic":
+        opts['extract_flat'] = False
+        opts['force_generic_extractor'] = True 
     
     if os.path.exists(COOKIE_FILE): opts['cookiefile'] = COOKIE_FILE
 
@@ -321,7 +311,7 @@ def process_media_task(url, quality_setting):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update): return
     grp = "✅ Set" if TELEGRAM_GROUP_ID else "⚠️ Missing"
-    txt = f"👋 **Stream Bot!**\n📂 Group: {grp}\n\n`/search MovieName`"
+    txt = f"👋 **Advanced Stream Bot!**\n📂 Group: {grp}\n\n`/search MovieName`"
     if update.effective_user.id == OWNER_ID: txt += "\n\n👮‍♂️ Admin: `/add`"
     await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
 
@@ -371,7 +361,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if idx >= len(results): return
         
         movie = results[idx]
-        await query.edit_message_text(f"🔄 Finding Streams for:\n**{movie['title']}**...")
+        await query.edit_message_text(f"🔄 Scanning Streams for:\n**{movie['title']}**...")
         
         loop = asyncio.get_running_loop()
         streams = await loop.run_in_executor(executor, find_streaming_link, movie['url'])
@@ -415,7 +405,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ ENV Error: GROUP_ID missing.")
             return
 
-        await query.edit_message_text(f"⬇️ **Downloading...**\nQuality: {qual}p\n\n(Scanning for hidden video file...)")
+        await query.edit_message_text(f"⬇️ **Downloading...**\nQuality: {qual}p\n\n(Bypassing protection...)")
         
         loop = asyncio.get_running_loop()
         res = await loop.run_in_executor(executor, process_media_task, url, qual)
@@ -483,4 +473,3 @@ def webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-    
