@@ -167,17 +167,19 @@ def find_streaming_link(url):
             text = a.text.lower()
             href = a['href']
             
-            if "watch" in text or "online" in text or "stream" in text or "hubcloud" in href or "hdstream" in href or "file" in href:
-                if "http" in href and "category" not in href:
+            # Keywords: hubcdn, hubcloud, hdstream, etc.
+            if any(x in href for x in ['hubcdn', 'hubcloud', 'hdstream', 'drive', 'file']):
+                if "http" in href:
                     label = f"▶️ {a.text.strip()[:30]}"
+                    if not label.strip(): label = "▶️ Stream Link"
                     if not any(s['url'] == href for s in stream_targets):
                         stream_targets.append({"label": label, "url": href})
         
-        # Fallback to download links if no stream link found
+        # Also grab "Watch Online" buttons if they are generic links
         if not stream_targets:
             for a in all_links:
-                if "720p" in a.text or "1080p" in a.text:
-                     label = f"📥 {a.text.strip()[:30]}"
+                if "watch" in a.text.lower() or "stream" in a.text.lower():
+                     label = f"▶️ {a.text.strip()[:30]}"
                      stream_targets.append({"label": label, "url": a['href']})
 
         return stream_targets
@@ -185,40 +187,60 @@ def find_streaming_link(url):
         logger.error(f"Parse Error: {e}")
         return []
 
-# --- 3. CUSTOM LINK RESOLVER (Fixes 'Unsupported URL') ---
+# --- 3. CUSTOM LINK RESOLVER (THE FIX) ---
 def resolve_custom_stream(url):
     """
-    Extracts the REAL video file (.mp4/.m3u8) from hosting sites like hdstream4u.
+    Extracts the REAL video file (.mp4/.m3u8) from hubcdn/hdstream.
     """
     logger.info(f"🕵️ Resolving: {url}")
+    
+    # Common domains for this logic
+    target_hosts = ['hubcdn', 'hubcloud', 'hdstream', 'hubfiles']
+    if not any(h in url for h in target_hosts):
+        return url # Return original if not a target host
+
     session = requests.Session()
-    session.headers.update(get_headers())
+    # Use generic headers, sometimes Referer is needed
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": TARGET_DOMAIN
+    })
     
     try:
-        # Case 1: HDStream4u / HubCloud
-        if "hdstream4u" in url or "hubcloud" in url:
-            resp = session.get(url, timeout=15)
-            html = resp.text
-            
-            # Look for .m3u8 or .mp4 inside scripts
-            # Pattern: file: "https://...m3u8"
-            match = re.search(r'file:\s*"([^"]+\.(?:m3u8|mp4))"', html)
+        resp = session.get(url, timeout=15, allow_redirects=True)
+        html = resp.text
+        final_url = resp.url # In case of redirects
+        
+        # METHOD 1: Look for 'file' or 'source' in JavaScript
+        # HubCDN/Cloud often uses JWPlayer or similar
+        # Pattern: file: "https://....m3u8"
+        
+        # Regex for .m3u8 or .mp4 inside quotes
+        patterns = [
+            r'file:\s*"([^"]+\.(?:m3u8|mp4))"',
+            r'source\s*:\s*"([^"]+\.(?:m3u8|mp4))"',
+            r'src\s*:\s*"([^"]+\.(?:m3u8|mp4))"',
+            r'sources\s*:\s*\[\s*{\s*file\s*:\s*"([^"]+)"',
+        ]
+        
+        for p in patterns:
+            match = re.search(p, html)
             if match:
-                return match.group(1)
-            
-            # Pattern 2: source src="..."
-            match2 = re.search(r'source src="([^"]+)"', html)
-            if match2:
-                return match2.group(1)
-                
-            # Pattern 3: window.location (Redirects)
-            if "window.location.replace" in html:
-                 match3 = re.search(r'window\.location\.replace\("([^"]+)"\)', html)
-                 if match3:
-                     return match3.group(1)
+                direct_link = match.group(1)
+                logger.info(f"✅ Found Direct Link: {direct_link}")
+                return direct_link
 
-        # Return original if no special handling needed or found
-        return url
+        # METHOD 2: Packed JavaScript (Common in HubCloud)
+        # Often code is packed like eval(function(p,a,c,k,e,d)...)
+        # This is hard to decode in Python without 'jsbeautifier' or 'unpacker'
+        # But sometimes the link is just sitting in a 'download' button
+        
+        dl_btn = re.search(r'href="([^"]+\.mp4)"', html)
+        if dl_btn:
+            return dl_btn.group(1)
+
+        logger.warning("❌ Could not extract direct link via Regex. Trying original URL with yt-dlp generic extractor.")
+        return final_url
         
     except Exception as e:
         logger.error(f"Resolver Error: {e}")
@@ -231,10 +253,9 @@ def process_media_task(url, quality_setting):
     
     # STEP 1: RESOLVE URL (Fix for Unsupported URL)
     final_url = resolve_custom_stream(url)
-    logger.info(f"⬇️ Downloading: {final_url}")
+    logger.info(f"⬇️ Passing to yt-dlp: {final_url}")
 
     # Configure yt-dlp
-    # For HLS (m3u8), we need ffmpeg. Render has ffmpeg pre-installed usually.
     if quality_setting == '480':
         fmt = 'bestvideo[height<=480]+bestaudio/best[height<=480]/best'
     elif quality_setting == '720':
@@ -252,8 +273,11 @@ def process_media_task(url, quality_setting):
         'geo_bypass': True,
         'noplaylist': True,
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
-        # HLS options
         'hls_prefer_native': True,
+        # Pass referer to yt-dlp just in case the direct link needs it
+        'http_headers': {
+            'Referer': url # The page we extracted from
+        }
     }
     
     if os.path.exists(COOKIE_FILE): opts['cookiefile'] = COOKIE_FILE
@@ -263,9 +287,9 @@ def process_media_task(url, quality_setting):
             info = ydl.extract_info(final_url, download=True)
             fpath = ydl.prepare_filename(info)
             
-            # Handle potential extension changes after merge
+            # Handle extension fix
             base, _ = os.path.splitext(fpath)
-            for ext in ['.mp4', '.mkv', '.webm']:
+            for ext in ['.mp4', '.mkv', '.webm', '.ts']:
                 if os.path.exists(base + ext):
                     fpath = base + ext
                     break
@@ -397,9 +421,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fpath = res['path']
         fsize = res['size']
         
-        # 50MB Limit Check (Telegram Bot API Limit)
+        # 50MB Limit Check
         if fsize > 49 * 1024 * 1024:
-            await query.edit_message_text(f"❌ File too big ({get_readable_size(fsize)}).\nTelegram Bot limit is 50MB.\nTry 480p or shorter video.")
+            await query.edit_message_text(f"❌ File too big ({get_readable_size(fsize)}).\nTelegram Bot limit is 50MB.\nTry 480p.")
             os.remove(fpath)
             return
 
