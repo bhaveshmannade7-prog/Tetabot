@@ -92,18 +92,28 @@ async def check_auth(update: Update):
         return False
     return True
 
-# --- ROBUST NETWORK ENGINE ---
+# --- BROWSER HEADER ENGINE (No Cloudscraper) ---
 def get_fake_headers(referer=None):
-    """Mimics a real PC Chrome browser to bypass 'No Results' due to bot detection."""
+    """
+    Pure Requests Headers that mimic Chrome perfectly.
+    This prevents the 'NoneType' error because we don't use cloudscraper.
+    """
     head = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
     }
     if referer:
         head["Referer"] = referer
+        head["Sec-Fetch-Site"] = "same-origin"
     return head
 
 def get_cookies_dict():
@@ -119,12 +129,8 @@ def get_cookies_dict():
         except: pass
     return cookies
 
-# --- 1. SEARCH (BRUTE FORCE FIX) ---
+# --- 1. SEARCH (Universal Scanner) ---
 def search_website(query):
-    """
-    Scans ALL links on the page instead of specific divs.
-    Fixes 'No Results Found' if theme changes.
-    """
     search_url = f"{TARGET_DOMAIN}/?s={query.replace(' ', '+')}"
     logger.info(f"🔎 Searching: {search_url}")
     
@@ -133,17 +139,18 @@ def search_website(query):
         session.headers.update(get_fake_headers(TARGET_DOMAIN))
         session.cookies.update(get_cookies_dict())
         
-        resp = session.get(search_url, timeout=20)
+        resp = session.get(search_url, timeout=15)
         
-        # Cloudflare Check
-        if "Just a moment" in resp.text:
-            logger.error("❌ Blocked by Cloudflare (No Results)")
-            return [{"title": "⚠️ Cloudflare Blocked. Update Cookies!", "url": "#"}]
+        # Check Status
+        if resp.status_code != 200:
+            logger.error(f"❌ Search Blocked: HTTP {resp.status_code}")
+            return []
 
         soup = BeautifulSoup(resp.text, 'lxml')
         results = []
         
-        # BRUTE FORCE PARSER: Get ALL links
+        # BRUTE FORCE PARSER: Scan ALL links
+        # This handles theme changes where class names might change
         all_links = soup.find_all('a', href=True)
         
         seen_urls = set()
@@ -151,18 +158,27 @@ def search_website(query):
         
         for a in all_links:
             url = a['href']
-            title = a.get('title') or a.text.strip()
-            
-            # --- FILTER LOGIC ---
-            # 1. Skip system links
+            # Try to get title from various attributes
+            title = a.get('title') 
+            if not title:
+                # Look for nested tags like p, h2, h3, figcaption
+                for tag in ['p', 'h2', 'h3', 'h4', 'figcaption', 'span']:
+                    child = a.find(tag)
+                    if child:
+                        title = child.get_text(strip=True)
+                        break
+            if not title:
+                title = a.get_text(strip=True)
+
+            # Filter Logic
             if not url.startswith("http"): continue
-            if any(x in url for x in ['/page/', '/category/', '/tag/', 'wp-json', 'xmlrpc', '#']): continue
-            if not title or len(title) < 5: continue
+            if any(x in url for x in ['/page/', '/category/', '/tag/', 'wp-json', 'xmlrpc', '#', 'facebook', 'twitter']): continue
+            if not title or len(title) < 4: continue
             
-            # 2. Skip duplicates
+            # Skip duplicates
             if url in seen_urls: continue
             
-            # 3. Relevance Check (At least one word must match)
+            # Relevance: Title must contain at least one word from query
             if any(w in title.lower() for w in query_words):
                 clean_title = title.replace("Download", "").replace("Full Movie", "").strip()
                 results.append({"title": clean_title, "url": url})
@@ -175,9 +191,8 @@ def search_website(query):
         logger.error(f"Search Error: {e}")
         return []
 
-# --- 2. FIND STREAMS ---
+# --- 2. FIND STREAMS (Watch Buttons) ---
 def find_streaming_link(url):
-    if url == "#": return [] # Handle error case
     logger.info(f"📂 Parsing: {url}")
     try:
         session = requests.Session()
@@ -193,70 +208,78 @@ def find_streaming_link(url):
             text = a.text.lower()
             href = a['href']
             
-            # Smart Keyword Match (HubCDN, Drive, etc.)
-            keywords = ['hubcdn', 'hubcloud', 'hdstream', 'drive', 'file', 'fans', 'wish', 'gdtot']
+            # Keywords for streaming hosts
+            keywords = ['hubcdn', 'hubcloud', 'hdstream', 'drive', 'file', 'fans', 'wish', 'gdtot', 'watch']
             if any(x in href for x in keywords):
                 if "http" in href:
                     label = f"▶️ {a.text.strip()[:30]}"
-                    if not label.strip() or "Click" in label: label = "▶️ Stream Link"
+                    if not label.strip() or "Click" in label or "Download" in label: label = "▶️ Stream Link"
                     if not any(s['url'] == href for s in stream_targets):
                         stream_targets.append({"label": label, "url": href})
-        
-        # Fallback: Watch Online buttons
-        if not stream_targets:
-            for a in all_links:
-                if "watch" in a.text.lower() or "stream" in a.text.lower():
-                     label = f"▶️ {a.text.strip()[:30]}"
-                     stream_targets.append({"label": label, "url": a['href']})
 
         return stream_targets
     except Exception as e:
         logger.error(f"Parse Error: {e}")
         return []
 
-# --- 3. HUBCDN FIX (Generic Fallback) ---
-def is_valid_url(url):
+# --- 3. HUBCDN DECRYPTER (Regex + Blind Mode) ---
+def is_clean_url(url):
+    """Checks if the extracted string is a valid URL and not code."""
     if not url: return False
     if not url.startswith("http"): return False
     if "${" in url or "{" in url or "}" in url: return False 
-    if ".js" in url or ".css" in url: return False
+    if " " in url or "\n" in url: return False
     return True
 
 def resolve_hubcdn_logic(url):
     """
-    Hybrid Decryption: Regex -> Fallback to Generic
+    Attempts to find .m3u8/.mp4. If fails, returns URL for Generic Extraction.
     """
-    logger.info(f"🕵️ Decrypting: {url}")
+    logger.info(f"🕵️ Analyzing: {url}")
     
     session = requests.Session()
     session.headers.update(get_fake_headers(url))
     
     try:
+        # Step 1: Get HTML
         resp = session.get(url, timeout=15, allow_redirects=True)
         html = resp.text
         
-        # Method A: Regex for direct links
+        # Step 2: Regex for clean matches
+        # This targets direct file links
         patterns = [
             r'file\s*:\s*["\'](https?://[^"\']+\.m3u8[^"\']*)["\']',
             r'source\s*:\s*["\'](https?://[^"\']+\.mp4[^"\']*)["\']',
-            r'src\s*:\s*["\'](https?://[^"\']+\.m3u8[^"\']*)["\']'
+            r'src\s*:\s*["\'](https?://[^"\']+\.m3u8[^"\']*)["\']',
+            r'["\'](https?://[^"\']+\.m3u8[^"\']*)["\']'
         ]
         
         for p in patterns:
             matches = re.findall(p, html)
             for m in matches:
-                if is_valid_url(m):
-                    logger.info(f"✅ Found Direct: {m}")
-                    return m, False
+                if is_clean_url(m):
+                    logger.info(f"✅ Found Regex Match: {m}")
+                    return m, False # False = Not generic mode
 
-        # Method B: GENERIC FALLBACK (The Fix for text 2.txt)
-        # If regex failed, it means link is obfuscated in JS.
-        # We pass the PAGE URL to yt-dlp.
-        logger.warning("⚠️ Obfuscated link detected. Using Generic Mode.")
-        return url, True 
+        # Step 3: Check for Obfuscated Inputs (common in text 2.txt scenarios)
+        # Sometimes hidden inputs hold the real link
+        soup = BeautifulSoup(html, 'lxml')
+        inputs = soup.find_all('input')
+        for i in inputs:
+            val = i.get('value', '')
+            if is_clean_url(val) and (".mp4" in val or ".m3u8" in val):
+                logger.info("✅ Found Hidden Input")
+                return val, False
+
+        # Step 4: FALLBACK - BLIND MODE
+        # If we couldn't regex it (because of obfuscated JS), 
+        # we assume yt-dlp's internal JS interpreter can handle it.
+        logger.warning("⚠️ No direct match. Using Generic Mode.")
+        return url, True # Force Generic = True
 
     except Exception as e:
         logger.error(f"Decryption Error: {e}")
+        # Even on error, try passing the URL to yt-dlp
         return url, True
 
 # --- 4. DOWNLOAD ENGINE ---
@@ -264,8 +287,12 @@ def process_media_task(url, quality_setting):
     if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
     timestamp = int(time.time())
     
+    # 1. RESOLVE URL
     final_url, use_generic = resolve_hubcdn_logic(url)
     
+    if not final_url:
+        return {"status": False, "error": "Extraction failed."}
+
     logger.info(f"⬇️ Downloading: {final_url} (Generic: {use_generic})")
 
     # Configure yt-dlp
@@ -285,8 +312,8 @@ def process_media_task(url, quality_setting):
         'no_warnings': True,
         'geo_bypass': True,
         'noplaylist': True,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121.0.0.0 Safari/537.36',
         'hls_prefer_native': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'http_headers': {
             'Referer': url,
             'Origin': '/'.join(url.split('/')[:3])
@@ -294,6 +321,7 @@ def process_media_task(url, quality_setting):
     }
     
     if use_generic:
+        # Force generic extraction if regex failed
         opts['force_generic_extractor'] = True
         opts['nocheckcertificate'] = True
         opts['ignoreerrors'] = True 
@@ -312,7 +340,7 @@ def process_media_task(url, quality_setting):
                     break
 
             if not os.path.exists(fpath):
-                return {"status": False, "error": "File not found (yt-dlp failed)."}
+                return {"status": False, "error": "File not found (Download failed)."}
 
             fsize = os.path.getsize(fpath)
             
@@ -332,7 +360,7 @@ def process_media_task(url, quality_setting):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update): return
     grp = "✅ Set" if TELEGRAM_GROUP_ID else "⚠️ Missing"
-    txt = f"👋 **Bot Ready!**\n📂 Group: {grp}\n\n`/search MovieName`"
+    txt = f"👋 **Stream Bot (Final Fix)**\n📂 Group: {grp}\n\n`/search MovieName`"
     if update.effective_user.id == OWNER_ID: txt += "\n\n👮‍♂️ Admin: `/add`"
     await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
 
@@ -360,13 +388,9 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     results = await loop.run_in_executor(executor, search_website, query)
     
     if not results:
-        await update.message.reply_text("❌ No results found.\n(Website Structure Changed or Blocked)")
+        await update.message.reply_text("❌ No results found.\n(Website structure changed or Cookies expired)")
         return
     
-    if results[0]['title'].startswith("⚠️"):
-         await update.message.reply_text(f"❌ {results[0]['title']}")
-         return
-
     context.user_data['search_res'] = results
     kb = []
     for idx, m in enumerate(results):
@@ -385,7 +409,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if idx >= len(results): return
         
         movie = results[idx]
-        await query.edit_message_text(f"🔄 Scanning Streams for:\n**{movie['title']}**...")
+        await query.edit_message_text(f"🔄 Finding Streams for:\n**{movie['title']}**...")
         
         loop = asyncio.get_running_loop()
         streams = await loop.run_in_executor(executor, find_streaming_link, movie['url'])
@@ -427,7 +451,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ ENV Error: GROUP_ID missing.")
             return
 
-        await query.edit_message_text(f"⬇️ **Downloading...**\nQuality: {qual}p\n\n(This handles Hidden Links too...)")
+        await query.edit_message_text(f"⬇️ **Downloading...**\nQuality: {qual}p\n\n(Bypassing Protection...)")
         
         loop = asyncio.get_running_loop()
         res = await loop.run_in_executor(executor, process_media_task, url, qual)
@@ -494,3 +518,4 @@ def webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+    
