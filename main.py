@@ -158,7 +158,7 @@ def find_streaming_link(url):
             text = a.text.lower()
             href = a['href']
             
-            # Smart Keyword Match
+            # Keywords
             if any(x in href for x in ['hubcdn', 'hubcloud', 'hdstream', 'drive', 'file', 'fans', 'wish']):
                 if "http" in href:
                     label = f"▶️ {a.text.strip()[:30]}"
@@ -177,10 +177,18 @@ def find_streaming_link(url):
         logger.error(f"Parse Error: {e}")
         return []
 
-# --- 3. HUB-CDN DECRYPTER (Strict Validator) ---
+# --- 3. SURGICAL HUB-CDN EXTRACTOR (The Fix) ---
+def is_valid_url(url):
+    """Checks if the URL is real and not a template variable."""
+    if not url: return False
+    if not url.startswith("http"): return False
+    if "${" in url or "{" in url or "}" in url: return False # The specific fix
+    if ".js" in url or ".css" in url: return False
+    return True
+
 def resolve_hubcdn_logic(url):
     """
-    Decodes HubCDN links with Strict Validation to avoid '${link}' errors.
+    Extracts ONLY valid .m3u8 or .mp4 links.
     """
     logger.info(f"🕵️ Decrypting HubCDN: {url}")
     scraper = get_scraper()
@@ -189,43 +197,45 @@ def resolve_hubcdn_logic(url):
         resp = scraper.get(url, timeout=15, allow_redirects=True)
         html = resp.text
         
-        # --- STRATEGY 1: Strict Regex for M3U8/MP4 ---
-        # Look for http/https followed by .m3u8 or .mp4
-        # We ignore anything that doesn't start with http
-        
-        regex_patterns = [
-            r'file:\s*["\'](https?://[^"\']+\.m3u8)["\']',
-            r'source:\s*["\'](https?://[^"\']+\.mp4)["\']',
-            r'src:\s*["\'](https?://[^"\']+\.m3u8)["\']',
-            r'["\'](https?://[^"\']+\.m3u8)["\']'
+        # 1. Regex for M3U8 (HLS)
+        # We look for 'file': 'https://...' or src: 'https://...'
+        m3u8_patterns = [
+            r'file\s*:\s*["\'](https?://[^"\']+\.m3u8[^"\']*)["\']',
+            r'source\s*:\s*["\'](https?://[^"\']+\.m3u8[^"\']*)["\']',
+            r'src\s*:\s*["\'](https?://[^"\']+\.m3u8[^"\']*)["\']',
+            r'["\'](https?://[^"\']+\.m3u8[^"\']*)["\']'
         ]
         
-        for p in regex_patterns:
+        for p in m3u8_patterns:
             matches = re.findall(p, html)
             for m in matches:
-                # CRITICAL CHECK: Is it a valid URL?
-                if "http" in m and "${" not in m and "{" not in m:
-                    logger.info(f"✅ Found Clean Match: {m}")
-                    return m, False # False = Not Generic Mode
+                if is_valid_url(m):
+                    logger.info(f"✅ Found M3U8: {m}")
+                    return m
 
-        # --- STRATEGY 2: Check for packed or hidden variables ---
-        # Some players use var url = "https://...";
+        # 2. Regex for MP4
+        mp4_patterns = [
+            r'file\s*:\s*["\'](https?://[^"\']+\.mp4[^"\']*)["\']',
+            r'src\s*:\s*["\'](https?://[^"\']+\.mp4[^"\']*)["\']',
+            r'["\'](https?://[^"\']+\.mp4[^"\']*)["\']'
+        ]
         
-        var_matches = re.findall(r'var\s+\w+\s*=\s*["\'](https?://[^"\']+)["\']', html)
-        for m in var_matches:
-            if (".m3u8" in m or ".mp4" in m) and "${" not in m:
-                return m, False
+        for p in mp4_patterns:
+            matches = re.findall(p, html)
+            for m in matches:
+                if is_valid_url(m):
+                    logger.info(f"✅ Found MP4: {m}")
+                    return m
 
-        # --- STRATEGY 3: Fallback to Generic ---
-        # If we can't find the clean link, we pass the original URL to yt-dlp
-        # BUT we must handle the case where yt-dlp might fail on the original URL.
-        
-        logger.warning("⚠️ No direct regex match. Using Generic Mode on Original URL.")
-        return url, True # True = Force Generic Mode
+        # 3. If extraction fails, we CANNOT pass the original URL to yt-dlp
+        # because yt-dlp doesn't support HubCDN.
+        # We must return None to trigger an error instead of passing junk.
+        logger.warning("⚠️ No valid video stream found in HTML.")
+        return None
 
     except Exception as e:
         logger.error(f"Decryption Error: {e}")
-        return url, True
+        return None
 
 # --- 4. DOWNLOAD ENGINE ---
 def process_media_task(url, quality_setting):
@@ -233,14 +243,15 @@ def process_media_task(url, quality_setting):
     timestamp = int(time.time())
     
     # 1. ATTEMPT DECRYPTION
-    final_url, use_generic = resolve_hubcdn_logic(url)
+    # We enforce finding a direct link. 
+    # Passing 'hubcdn.fans' directly to yt-dlp causes "Unsupported URL"
+    final_url = resolve_hubcdn_logic(url)
     
-    # SAFETY CHECK: Ensure final_url is actually a string and looks like a URL
-    if not final_url or not isinstance(final_url, str) or not final_url.startswith("http"):
-        logger.error(f"❌ Invalid URL detected: {final_url}")
-        return {"status": False, "error": "Invalid URL found during decryption."}
+    if not final_url:
+        # If we failed to find the m3u8, we cannot proceed.
+        return {"status": False, "error": "Could not extract direct video link from HubCDN. Site protection is too high."}
 
-    logger.info(f"⬇️ Downloading: {final_url} (Generic: {use_generic})")
+    logger.info(f"⬇️ Downloading: {final_url}")
 
     # Configure yt-dlp
     if quality_setting == '480':
@@ -261,16 +272,13 @@ def process_media_task(url, quality_setting):
         'noplaylist': True,
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/123.0.0.0 Safari/537.36',
         'hls_prefer_native': True,
+        # REFERER IS CRITICAL for direct links to work
         'http_headers': {
             'Referer': url,
             'Origin': '/'.join(url.split('/')[:3])
         }
     }
     
-    if use_generic:
-        opts['force_generic_extractor'] = True
-        opts['nocheckcertificate'] = True
-
     if os.path.exists(COOKIE_FILE): opts['cookiefile'] = COOKIE_FILE
 
     try:
@@ -305,7 +313,7 @@ def process_media_task(url, quality_setting):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update): return
     grp = "✅ Set" if TELEGRAM_GROUP_ID else "⚠️ Missing"
-    txt = f"👋 **Stream Bot (Strict Mode)**\n📂 Group: {grp}\n\n`/search MovieName`"
+    txt = f"👋 **Stream Bot (Fixed)**\n📂 Group: {grp}\n\n`/search MovieName`"
     if update.effective_user.id == OWNER_ID: txt += "\n\n👮‍♂️ Admin: `/add`"
     await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
 
@@ -396,7 +404,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ ENV Error: GROUP_ID missing.")
             return
 
-        await query.edit_message_text(f"⬇️ **Downloading...**\nQuality: {qual}p\n\n(Wait ~2-5 mins...)")
+        await query.edit_message_text(f"⬇️ **Downloading...**\nQuality: {qual}p\n\n(Extracting Direct Video Link...)")
         
         loop = asyncio.get_running_loop()
         res = await loop.run_in_executor(executor, process_media_task, url, qual)
@@ -463,4 +471,3 @@ def webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
-    
