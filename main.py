@@ -23,8 +23,11 @@ try:
 except:
     OWNER_ID = 0
 
+# New: Group ID where movie will be uploaded
+# Example: -1001234567890
+TELEGRAM_GROUP_ID = os.getenv("GROUP_ID") 
+
 COOKIES_ENV = os.getenv("COOKIES_CONTENT")
-# Website URL (Default: hdhub4u.rehab)
 TARGET_DOMAIN = os.getenv("WEBSITE_URL", "https://hdhub4u.rehab").rstrip("/")
 
 # --- SETTINGS ---
@@ -38,9 +41,9 @@ logging.basicConfig(
     level=logging.INFO,
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("SmartBot")
+logger = logging.getLogger("StreamBot")
 
-# --- DATA & AUTH ---
+# --- DATA ---
 def load_users():
     if not os.path.exists(DATA_FILE): return {OWNER_ID}
     try:
@@ -57,7 +60,7 @@ def save_users(users_set):
 
 AUTHORIZED_USERS = load_users()
 
-# --- COOKIE SETUP ---
+# --- COOKIES ---
 def setup_cookies():
     valid_lines = ["# Netscape HTTP Cookie File"]
     if COOKIES_ENV and len(COOKIES_ENV) > 10:
@@ -73,9 +76,17 @@ def setup_cookies():
 setup_cookies()
 
 app = Flask(__name__)
-executor = ThreadPoolExecutor(max_workers=8)
+# High workers for downloading
+executor = ThreadPoolExecutor(max_workers=4)
 
 # --- UTILS ---
+def get_readable_size(size_in_bytes):
+    if not size_in_bytes: return "Unknown"
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size_in_bytes < 1024.0: return f"{size_in_bytes:.1f} {unit}"
+        size_in_bytes /= 1024.0
+    return f"{size_in_bytes:.1f} TB"
+
 async def check_auth(update: Update):
     if not update.effective_user: return False
     uid = update.effective_user.id
@@ -85,13 +96,11 @@ async def check_auth(update: Update):
         return False
     return True
 
-# --- SMART NETWORK ENGINE ---
-
+# --- NETWORK ENGINE ---
 def get_headers(referer=None):
     head = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
         "Upgrade-Insecure-Requests": "1",
     }
     if referer: head["Referer"] = referer
@@ -110,10 +119,10 @@ def get_cookies_dict():
         except: pass
     return cookies
 
-# --- 1. INTELLIGENT SEARCH (Garbage Remover) ---
-def search_smart(query):
+# --- 1. SMART SEARCH ---
+def search_website(query):
     search_url = f"{TARGET_DOMAIN}/?s={query.replace(' ', '+')}"
-    logger.info(f"🔎 Scanning: {search_url}")
+    logger.info(f"🔎 Searching: {search_url}")
     
     try:
         session = requests.Session()
@@ -124,22 +133,9 @@ def search_smart(query):
         soup = BeautifulSoup(resp.text, 'lxml')
         results = []
         
-        # --- Strict Filtering ---
-        # Only look for actual movie posts, not sidebar items
-        # Usually inside a container like 'main', 'primary', or specific classes
+        # Select all potential movie containers
+        candidates = soup.select('ul.recent-movies li, article.post, div.result-item')
         
-        candidates = []
-        # Priority 1: Search specific lists
-        lists = soup.select('ul.recent-movies, div.search-results, main#main')
-        if lists:
-            for l in lists:
-                candidates.extend(l.find_all('li'))
-                candidates.extend(l.find_all('article'))
-        
-        # Priority 2: Generic fallback if layout changes
-        if not candidates:
-            candidates = soup.find_all('article')
-
         query_words = query.lower().split()
         
         for item in candidates:
@@ -148,33 +144,31 @@ def search_smart(query):
             
             url = a_tag.get('href')
             
-            # Smart Title Extraction
+            # Title extraction
             title = ""
-            caption = item.find('figcaption')
-            if caption: title = caption.text.strip()
+            if item.find('figcaption'): title = item.find('figcaption').text.strip()
             elif a_tag.get('title'): title = a_tag.get('title')
             else: title = a_tag.text.strip()
             
             if not url or not title: continue
-            if "page/" in url: continue # Skip pagination links
             
-            # --- RELEVANCE CHECK ---
-            # Title MUST contain at least one word from query to be shown
-            title_lower = title.lower()
-            if any(word in title_lower for word in query_words):
-                # Clean Title
-                clean_title = title.replace("Download", "").replace("Full Movie", "").replace("Free", "").strip()
+            # Relevance Filter
+            if any(w in title.lower() for w in query_words):
+                clean_title = title.replace("Download", "").replace("Full Movie", "").strip()
                 results.append({"title": clean_title, "url": url})
+                if len(results) >= 8: break
         
-        return results[:8] # Return top 8 accurate results
-
+        return results
     except Exception as e:
         logger.error(f"Search Error: {e}")
         return []
 
-# --- 2. SURGICAL EXTRACTION (No Trash Links) ---
-def extract_quality_smart(url):
-    logger.info(f"📂 Extracting: {url}")
+# --- 2. FIND STREAMING LINKS ---
+def find_streaming_link(url):
+    """
+    Parses the movie page to find 'Watch Online' or 'Stream' section.
+    """
+    logger.info(f"📂 Parsing for Stream: {url}")
     try:
         session = requests.Session()
         session.headers.update(get_headers(TARGET_DOMAIN))
@@ -182,219 +176,132 @@ def extract_quality_smart(url):
         
         resp = session.get(url, timeout=20)
         soup = BeautifulSoup(resp.text, 'lxml')
-        options = []
         
-        # --- SURGICAL SCOPE ---
-        # Only look inside 'entry-content' or 'the-content' div
-        # This removes "Related Movies", Sidebar, Footer, etc.
-        content_area = soup.find('div', class_=re.compile(r'(entry-content|the-content|post-content)'))
+        # Logic: Find links that say "Watch Online", "Stream", "Instant"
+        # usually below download links
+        stream_targets = []
         
-        if not content_area: 
-            logger.warning("Main content area not found, scanning full page carefully.")
-            content_area = soup
-            
-        # Regex for valid qualities
-        valid_res = re.compile(r'(480p|720p|1080p|2160p|4k|10bit|hevc)', re.IGNORECASE)
-        
-        all_links = content_area.find_all('a', href=True)
-        
+        all_links = soup.find_all('a', href=True)
         for a in all_links:
-            text = a.get_text(" ", strip=True)
+            text = a.text.lower()
             href = a['href']
             
-            # Strict Filter: Must look like a download button
-            # Usually these buttons have specific classes or text styles
-            is_download_link = (
-                valid_res.search(text) or 
-                "Download" in text or 
-                "HubCloud" in text or 
-                "Drive" in text or
-                "Instant" in text
-            )
-            
-            if is_download_link and "http" in href:
-                # Icon assignment
-                icon = "📥"
-                if "1080p" in text: icon = "💎 1080p"
-                elif "720p" in text: icon = "🎥 720p"
-                elif "480p" in text: icon = "📱 480p"
-                
-                # Clean Label
-                label = text.replace("Download", "").replace("Links", "").replace("Link", "").strip()
-                if len(label) > 30: label = label[:30] + ".."
-                final_label = f"{icon} {label}"
-                
-                # Deduplicate
-                if not any(o['url'] == href for o in options):
-                    options.append({"label": final_label, "url": href})
-                    
-        return options
+            # Keywords for streaming
+            if "watch" in text or "online" in text or "stream" in text or "hubcloud" in href or "embed" in href:
+                if "http" in href and "category" not in href:
+                    label = f"▶️ {a.text.strip()[:30]}"
+                    if not any(s['url'] == href for s in stream_targets):
+                        stream_targets.append({"label": label, "url": href})
+        
+        # If no explicit stream links, grab the standard download links too
+        # because yt-dlp can stream from download links often
+        if not stream_targets:
+            for a in all_links:
+                if "720p" in a.text or "1080p" in a.text:
+                     label = f"📥 {a.text.strip()[:30]}"
+                     stream_targets.append({"label": label, "url": a['href']})
+
+        return stream_targets
     except Exception as e:
-        logger.error(f"Extraction Error: {e}")
+        logger.error(f"Stream Parse Error: {e}")
         return []
 
-# --- 3. AUTO-BYPASS ENGINE (The "Smart" Part) ---
-def bypass_mediator(url):
+# --- 3. DOWNLOAD & UPLOAD ENGINE ---
+def process_media_task(url, quality_setting):
     """
-    Attempts to traverse the Timer/Verification pages automatically.
+    Downloads media and Uploads to Group.
+    quality_setting: 'best', '720', '480'
     """
-    logger.info(f"🤖 Bypassing: {url}")
+    if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
+    timestamp = int(time.time())
     
-    session = requests.Session()
-    session.headers.update(get_headers(TARGET_DOMAIN))
-    session.cookies.update(get_cookies_dict())
-    
+    # 1. Resolve Landing Page (Bypass)
+    # Most stream links are wrappers. We need the final URL.
     try:
-        # Step 1: Visit the Link
-        resp = session.get(url, allow_redirects=True, timeout=15)
-        final_url = resp.url
-        html = resp.text
-        
-        # CHECK 1: Is it already Telegram?
-        if "t.me" in final_url:
-            return {"type": "telegram", "url": final_url}
+        session = requests.Session()
+        session.headers.update(get_headers(TARGET_DOMAIN))
+        session.cookies.update(get_cookies_dict())
+        # Follow redirects to get real URL
+        final_url = session.get(url, allow_redirects=True, timeout=15).url
+    except:
+        final_url = url
+
+    logger.info(f"⬇️ Downloading from: {final_url} | Quality: {quality_setting}")
+
+    # 2. Configure yt-dlp for Size Control
+    # We use format selection to control size/quality
+    if quality_setting == '480':
+        fmt = 'bestvideo[height<=480]+bestaudio/best[height<=480]/best'
+    elif quality_setting == '720':
+        fmt = 'bestvideo[height<=720]+bestaudio/best[height<=720]/best'
+    else:
+        fmt = 'best' # Max quality
+
+    filename_template = f'{DOWNLOAD_DIR}/movie_{timestamp}.%(ext)s'
+
+    opts = {
+        'outtmpl': filename_template,
+        'format': fmt,
+        'quiet': True,
+        'no_warnings': True,
+        'geo_bypass': True,
+        'noplaylist': True,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    }
+    
+    if os.path.exists(COOKIE_FILE): opts['cookiefile'] = COOKIE_FILE
+
+    try:
+        # DOWNLOAD
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(final_url, download=True)
+            fpath = ydl.prepare_filename(info)
             
-        soup = BeautifulSoup(html, 'lxml')
-        
-        # CHECK 2: Look for "HubCloud" / "Drive" Links hidden in the page
-        # Often the verification page has the real link hidden in variables or forms
-        
-        # Regex to find links starting with common file hosts
-        link_regex = re.compile(r'https?://(hubcloud|hubdrive|drive|gdfluen|file|gdtot)[^\s"\']+')
-        found_links = link_regex.findall(html)
-        
-        if found_links:
-            # Found a deeper link!
-            deep_link = found_links[0]
-            if "t.me" in deep_link:
-                return {"type": "telegram", "url": deep_link}
-            return {"type": "link", "url": deep_link}
+            # Correction if merged
+            base, _ = os.path.splitext(fpath)
+            if not os.path.exists(fpath) and os.path.exists(base+".mp4"):
+                fpath = base+".mp4"
+            elif not os.path.exists(fpath) and os.path.exists(base+".mkv"):
+                fpath = base+".mkv"
 
-        # CHECK 3: Try to find the "Form" that submits after timer
-        # Many sites use a POST request to validate
-        forms = soup.find_all('form')
-        for form in forms:
-            action = form.get('action')
-            if action and ("verify" in action or "download" in action):
-                # This is risky without browser, but we can try to return this URL
-                # often clicking this form gives the link
-                return {"type": "link", "url": url} # Return original if complex
+            if not os.path.exists(fpath):
+                return {"status": False, "error": "Download failed (File not found)"}
 
-        # If we can't bypass programmatically (due to Captcha), 
-        # we return the current URL but cleaned up.
-        return {"type": "link", "url": final_url}
+            # Size Check (Telegram Limit)
+            fsize = os.path.getsize(fpath)
+            
+            # NOTE: Render Free cannot re-encode. We just check size.
+            return {
+                "status": True,
+                "path": fpath,
+                "size": fsize,
+                "title": info.get('title', 'Movie'),
+                "duration": info.get('duration')
+            }
 
     except Exception as e:
-        return {"type": "error", "error": str(e)}
+        return {"status": False, "error": str(e)}
 
 # --- HANDLERS ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_auth(update): return
+    
+    grp_status = "✅ Connected" if TELEGRAM_GROUP_ID else "⚠️ Not Set (Check ENV)"
+    
     txt = (
-        f"👋 **Ultra-Smart Bot Ready!**\n"
-        f"🌐 Site: `{TARGET_DOMAIN}`\n\n"
-        "🧠 **Capabilities:**\n"
-        "1. **Smart Search:** No garbage results.\n"
-        "2. **Auto-Filter:** Only extracts Movie Links.\n"
-        "3. **Bypass:** Attempts to find Telegram/Final links."
+        f"👋 **Stream-to-Group Bot!**\n"
+        f"📂 Group: {grp_status}\n\n"
+        "🎬 **How to use:**\n"
+        "1. `/search MovieName`\n"
+        "2. Select Movie\n"
+        "3. Select Stream Source\n"
+        "4. Choose Quality (Low = Small Size)\n"
+        "5. Bot uploads to Group!"
     )
-    if update.effective_user.id == OWNER_ID: txt += "\n\n👮‍♂️ Admin: `/add`, `/remove`"
+    if update.effective_user.id == OWNER_ID: txt += "\n\n👮‍♂️ `/add`, `/remove`"
     await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
 
-async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_auth(update): return
-    if not context.args:
-        await update.message.reply_text("❌ Usage: `/search Pushpa`")
-        return
-    
-    query = " ".join(context.args)
-    await update.message.reply_text(f"🧠 **AI Searching:** `{query}`...\n(Filtering garbage...)")
-    
-    loop = asyncio.get_running_loop()
-    results = await loop.run_in_executor(executor, search_smart, query)
-    
-    if not results:
-        await update.message.reply_text("❌ No accurate movies found.\n(Try exact spelling)")
-        return
-    
-    context.user_data['search_res'] = results
-    
-    keyboard = []
-    for idx, movie in enumerate(results):
-        keyboard.append([InlineKeyboardButton(f"🎬 {movie['title']}", callback_data=f"s_{idx}")])
-        
-    await update.message.reply_text(f"✅ Found {len(results)} Matches:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    
-    # 1. MOVIE SELECTION (Clean Extraction)
-    if data.startswith("s_"):
-        idx = int(data.split("_")[1])
-        results = context.user_data.get('search_res', [])
-        if idx >= len(results): return
-            
-        movie = results[idx]
-        await query.edit_message_text(f"📂 **Scanning Page...**\nMovie: `{movie['title']}`\n\n(Extracting ONLY quality links...)")
-        
-        loop = asyncio.get_running_loop()
-        quality_options = await loop.run_in_executor(executor, extract_quality_smart, movie['url'])
-        
-        if not quality_options:
-            await query.edit_message_text("❌ No valid download links found inside content area.")
-            return
-        
-        context.user_data['quality_opts'] = quality_options
-        
-        keyboard = []
-        for i, opt in enumerate(quality_options):
-            keyboard.append([InlineKeyboardButton(opt['label'], callback_data=f"l_{i}")])
-            
-        await query.edit_message_text(f"🎬 **{movie['title']}**\n👇 Select Quality:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    # 2. LINK BYPASS (The "Smart" Click)
-    if data.startswith("l_"):
-        idx = int(data.split("_")[1])
-        opts = context.user_data.get('quality_opts', [])
-        if idx >= len(opts): return
-        
-        target = opts[idx]
-        await query.edit_message_text(f"🤖 **Bot is Bypassing...**\nTarget: {target['label']}\n\n(Handling Timers & Redirects...)")
-        
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(executor, bypass_mediator, target['url'])
-        
-        if result.get("type") == "error":
-            await query.edit_message_text("❌ Bypass Failed. Manual Link below.")
-            final_url = target['url']
-        else:
-            final_url = result.get("url")
-        
-        # Result Display
-        if "t.me" in final_url:
-            msg = f"✈️ **Telegram Link Extracted!**\n\n🔗 [Click to Join/Download]({final_url})"
-            kb = [[InlineKeyboardButton("✈️ Open Telegram", url=final_url)]]
-        else:
-            msg = f"✅ **Final Link Extracted!**\n\nOriginal: {target['label']}\n🔗 **Bypassed Link:** `{final_url}`\n\n(Click below to Download)"
-            kb = [[InlineKeyboardButton("⬇️ Download / Watch", url=final_url)]]
-            
-        kb.append([InlineKeyboardButton("🔙 Back", callback_data="back_to_qual")])
-        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-        return
-
-    # 3. BACK
-    if data == "back_to_qual":
-        opts = context.user_data.get('quality_opts', [])
-        keyboard = []
-        for i, opt in enumerate(opts):
-            keyboard.append([InlineKeyboardButton(opt['label'], callback_data=f"l_{i}")])
-        await query.edit_message_text("👇 Select Quality:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-# --- ADMIN ---
 async def admin_ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID: return
     try:
@@ -406,9 +313,148 @@ async def admin_ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Done")
     except: await update.message.reply_text("Usage: `/add 12345`")
 
+# 1. SEARCH
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_auth(update): return
+    if not context.args:
+        await update.message.reply_text("❌ Usage: `/search Kalki`")
+        return
+    
+    query = " ".join(context.args)
+    await update.message.reply_text(f"🔍 Searching: `{query}`...")
+    
+    loop = asyncio.get_running_loop()
+    results = await loop.run_in_executor(executor, search_website, query)
+    
+    if not results:
+        await update.message.reply_text("❌ No results found.")
+        return
+    
+    context.user_data['search_res'] = results
+    keyboard = []
+    for idx, movie in enumerate(results):
+        keyboard.append([InlineKeyboardButton(f"🎬 {movie['title']}", callback_data=f"sel_{idx}")])
+        
+    await update.message.reply_text(f"✅ Found {len(results)} movies:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+# 2. SELECT MOVIE -> FIND STREAMS
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    
+    # A. Movie Selected
+    if data.startswith("sel_"):
+        idx = int(data.split("_")[1])
+        results = context.user_data.get('search_res', [])
+        if idx >= len(results): return
+        
+        movie = results[idx]
+        await query.edit_message_text(f"🔄 Fetching Stream Links for:\n**{movie['title']}**...")
+        
+        loop = asyncio.get_running_loop()
+        streams = await loop.run_in_executor(executor, find_streaming_link, movie['url'])
+        
+        if not streams:
+            await query.edit_message_text("❌ No Streaming/Watch Online links found.")
+            return
+        
+        context.user_data['streams'] = streams
+        context.user_data['movie_title'] = movie['title']
+        
+        keyboard = []
+        for i, s in enumerate(streams):
+            keyboard.append([InlineKeyboardButton(s['label'], callback_data=f"stm_{i}")])
+            
+        await query.edit_message_text("👇 Select Source:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # B. Source Selected -> Choose Quality (Size Control)
+    if data.startswith("stm_"):
+        idx = int(data.split("_")[1])
+        streams = context.user_data.get('streams', [])
+        if idx >= len(streams): return
+        
+        selected_stream = streams[idx]
+        context.user_data['target_url'] = selected_stream['url']
+        
+        # Quality Selection Menu
+        kb = [
+            [InlineKeyboardButton("📱 480p (Small Size)", callback_data="q_480")],
+            [InlineKeyboardButton("🎥 720p (Medium)", callback_data="q_720")],
+            [InlineKeyboardButton("💎 Best Quality (Large)", callback_data="q_best")]
+        ]
+        await query.edit_message_text(f"⚙️ Select Quality for:\n{selected_stream['label']}\n\n(Lower quality = Faster Upload)", reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    # C. Quality Selected -> Download & Upload
+    if data.startswith("q_"):
+        quality = data.split("_")[1]
+        url = context.user_data.get('target_url')
+        title = context.user_data.get('movie_title', 'Movie')
+        
+        if not TELEGRAM_GROUP_ID:
+            await query.edit_message_text("❌ Error: Group ID not set in Environment Variables.")
+            return
+
+        await query.edit_message_text(f"⬇️ **Downloading...**\nQuality: {quality}p\nTitle: {title}\n\n(This may take time, please wait...)")
+        
+        loop = asyncio.get_running_loop()
+        # Run heavy task
+        result = await loop.run_in_executor(executor, process_media_task, url, quality)
+        
+        if not result['status']:
+            await query.edit_message_text(f"❌ Download Failed:\n`{result.get('error')}`", parse_mode=ParseMode.MARKDOWN)
+            return
+            
+        fpath = result['path']
+        fsize = result['size']
+        
+        # TELEGRAM LIMIT CHECK
+        # Standard Bot: 50MB (approx 52428800 bytes)
+        # Local API: 2GB
+        LIMIT = 49 * 1024 * 1024 # Safe limit for standard bot
+        
+        if fsize > LIMIT:
+            await query.edit_message_text(
+                f"❌ **Upload Failed!**\n"
+                f"📁 File Size: `{get_readable_size(fsize)}`\n"
+                f"⛔ Telegram Limit: 50MB\n\n"
+                "Cloud server cannot upload large files without Local API.\n"
+                "Try selecting '480p' quality."
+            )
+            os.remove(fpath)
+            return
+
+        await query.edit_message_text(f"📤 **Uploading to Group...**\nSize: {get_readable_size(fsize)}")
+        
+        try:
+            # Upload to Group
+            with open(fpath, 'rb') as f:
+                await context.bot.send_video(
+                    chat_id=TELEGRAM_GROUP_ID,
+                    video=f,
+                    caption=f"🎬 **{title}**\n💿 Quality: {quality}p\n🤖 Uploaded by Bot",
+                    width=1280 if quality=='720' else 854,
+                    height=720 if quality=='720' else 480,
+                    duration=result.get('duration'),
+                    supports_streaming=True,
+                    write_timeout=300, # 5 min timeout for upload
+                    read_timeout=300
+                )
+            
+            await query.edit_message_text("✅ **Successfully Uploaded to Group!**")
+            
+        except Exception as e:
+            logger.error(f"Upload Error: {e}")
+            await query.edit_message_text("❌ Error sending to group. (Timeout or Permission issue)")
+        finally:
+            if os.path.exists(fpath): os.remove(fpath)
+
 # --- STARTUP ---
 async def main():
-    req = HTTPXRequest(connection_pool_size=10, read_timeout=60, write_timeout=60, connect_timeout=60)
+    # High timeouts for large file uploads
+    req = HTTPXRequest(connection_pool_size=10, read_timeout=300, write_timeout=300, connect_timeout=60)
     app_bot = Application.builder().token(BOT_TOKEN).request(req).build()
 
     app_bot.add_handler(CommandHandler("start", start))
@@ -438,3 +484,4 @@ def webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+            
