@@ -1,6 +1,6 @@
 import json, asyncio, os, random, logging
 from pyrogram import Client, filters, enums
-from pyrogram.errors import FloodWait, PeerFlood, UserPrivacyRestricted
+from pyrogram.errors import FloodWait, PeerFlood, UserPrivacyRestricted, PeerIdInvalid
 from flask import Flask
 from threading import Thread
 
@@ -25,7 +25,6 @@ for i in range(1, 11):
             cli = Client(name, session_string=session.strip(), api_id=API_ID, api_hash=API_HASH)
             workers.append(cli)
             logger.info(f"✅ Worker {i} loaded.")
-            # Pehli available string ko Boss (Controller) banana
             if boss_client is None:
                 boss_client = cli
                 logger.info(f"👑 Worker {i} assigned as Boss (Controller).")
@@ -35,7 +34,7 @@ for i in range(1, 11):
 # Flask for Render
 web_app = Flask(__name__)
 @web_app.route('/')
-def home(): return "Multi-Worker Engine V10 (Fixed) is Online! ⚡"
+def home(): return "Multi-Worker Engine V12 is Online! ⚡"
 
 def run_web():
     port = int(os.getenv("PORT", 8080))
@@ -68,13 +67,13 @@ if boss_client:
     @boss_client.on_message(filters.command("start") & filters.user(ADMIN_ID))
     async def start_cmd(c, m):
         text = (
-            "🚀 **Ultimate Multi-Worker V10 (FIXED)**\n\n"
-            f"👑 **Controller:** STRING_{SESSION_LIST_INDEX if 'SESSION_LIST_INDEX' in locals() else 'Active'}\n"
+            "🚀 **Ultimate Multi-Worker V12 (FIXED)**\n\n"
+            f"👑 **Controller:** Active\n"
             f"✅ **Total Workers:** {len(workers)}\n"
             f"⏱ **Speed:** {SETTINGS['speed']}s\n\n"
             "📍 `/scrape @group 1000` | `/scrape_active @group 1000`\n"
             "📍 `/setmsg1 Text...` (Upto 5) | `/speed 15`\n"
-            "📍 `/send` | `/status` | `/stop` | `/dump`"
+            "📍 `/send` | `/status` | `/stop` | `/dump` | `/sync`"
         )
         await m.reply(text)
 
@@ -96,37 +95,45 @@ if boss_client:
     @boss_client.on_message(filters.command("scrape_active") & filters.user(ADMIN_ID))
     async def scrape_history(c, m):
         try:
-            _, target, limit = m.text.split()
-            await m.reply("🔍 Scanning history...")
+            parts = m.text.split()
+            if len(parts) < 3: return await m.reply("❌ Format: `/scrape_active @group 1000` ya `/scrape_active -100xxx 1000` ")
+            target = parts[1]
+            if target.startswith("-") or target.isdigit(): target = int(target)
+            limit = int(parts[2])
+
+            await m.reply(f"🔍 `{target}` history scan kar raha hoon...")
             data = load_json(USERS_DB)
             count = 0
-            async for msg in c.get_chat_history(target, limit=int(limit)):
+            # Numeric ID support fix
+            async for msg in c.get_chat_history(target, limit=limit):
                 if msg.from_user and not msg.from_user.is_bot:
                     u_info = (msg.from_user.id, msg.from_user.username or "N/A", msg.from_user.first_name or "User")
                     if not any(u[0] == msg.from_user.id for u in data):
                         data.add(u_info)
                         count += 1
             save_json(USERS_DB, data)
-            await m.reply(f"✅ Scraped Active: {count}")
-        except Exception as e: await m.reply(f"❌ Error: {e}")
+            await m.reply(f"✅ Scraped Active: {count} | Total: {len(data)}")
+        except Exception as e: 
+            await m.reply(f"❌ Error: {str(e)}\n\n*Tip: Agar ID invalid hai toh pehle group join karein.*")
 
     @boss_client.on_message(filters.command("scrape") & filters.user(ADMIN_ID))
     async def scrape_normal(c, m):
         try:
-            _, target, limit = m.text.split()
+            parts = m.text.split()
+            target, limit = parts[1], int(parts[2])
             if target.startswith("-") or target.isdigit(): target = int(target)
-            await m.reply("🔍 Scraping members...")
+            await m.reply(f"🔍 `{target}` members list scrape kar raha hoon...")
             data = load_json(USERS_DB)
             count = 0
             async for member in c.get_chat_members(target):
-                if count >= int(limit): break
+                if count >= limit: break
                 if not member.user.is_bot:
                     u_info = (member.user.id, member.user.username or "N/A", member.user.first_name or "User")
                     if not any(u[0] == member.user.id for u in data):
                         data.add(u_info)
                         count += 1
             save_json(USERS_DB, data)
-            await m.reply(f"✅ Scraped: {count}")
+            await m.reply(f"✅ Scraped: {count} | Total: {len(data)}")
         except Exception as e: await m.reply(f"❌ Error: {e}")
 
     @boss_client.on_message(filters.command("send") & filters.user(ADMIN_ID))
@@ -168,6 +175,16 @@ if boss_client:
                 os.remove(db)
         await m.reply("🗑️ Server files deleted.")
 
+    @boss_client.on_message(filters.command("sync") & filters.user(ADMIN_ID))
+    async def sync_cmd(c, m):
+        await m.reply("🔄 Syncing history...")
+        sent = load_json(SENT_DB)
+        async for dialog in c.get_dialogs():
+            if dialog.chat.type == enums.ChatType.PRIVATE:
+                sent.add(dialog.chat.id)
+        save_json(SENT_DB, sent)
+        await m.reply(f"✅ Sync Done! History size: {len(sent)}")
+
     @boss_client.on_message(filters.command("status") & filters.user(ADMIN_ID))
     async def status_cmd(c, m):
         sc, sn = len(load_json(USERS_DB)), len(load_json(SENT_DB))
@@ -182,17 +199,16 @@ if boss_client:
 async def main():
     Thread(target=run_web).start()
     if not workers:
-        logger.error("No strings found. Check STRING_1 to STRING_10.")
+        logger.error("No strings found.")
         return
 
-    # Start all workers
     for cli in workers:
         await cli.start()
         try: await cli.send_message(ADMIN_ID, f"✅ Worker {cli.name} is Online!")
         except: pass
     
     logger.info(">>> Bot is fully started and listening.")
-    await asyncio.Event().wait() # Keep alive
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
