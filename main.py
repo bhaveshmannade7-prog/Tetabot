@@ -4,6 +4,7 @@ from pyrogram.errors import FloodWait, PeerFlood, UserPrivacyRestricted
 from flask import Flask
 from threading import Thread
 
+# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -11,176 +12,195 @@ logger = logging.getLogger(__name__)
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-# Multiple sessions comma separated: "string1,string2..."
-SESSIONS = [s.strip() for s in os.getenv("SESSIONS", "").split(",") if s.strip()]
-
-# Global DB & Settings
-USERS_DB = "scraped_users.json"
-SENT_DB = "sent_history.json"
-SETTINGS = {
-    "messages": [], # 5 Messages store honge
-    "is_running": False,
-    "speed": 12, # Default 12s
-    "total_sent": 0
-}
-
-# Clients Setup
-workers = []
-for i, s in enumerate(SESSIONS):
-    cli = Client(f"worker_{i}", session_string=s, api_id=API_ID, api_hash=API_HASH)
-    workers.append(cli)
-
-# Primary Admin App
-app = workers[0]
+RAW_SESSIONS = os.getenv("SESSIONS", "")
+SESSION_LIST = [s.strip() for s in RAW_SESSIONS.split(",") if s.strip()]
 
 # Flask for Render
 web_app = Flask(__name__)
 @web_app.route('/')
 def home(): return "Multi-Worker Bot is Active! ⚡"
 
-# --- JSON UTILS ---
-def save_json(f, d):
-    with open(f, "w") as file: json.dump(list(d), file, indent=4)
+# DB Files
+USERS_DB = "scraped_users.json"
+SENT_DB = "sent_history.json"
 
-def load_json(f):
-    if os.path.exists(f):
-        with open(f, "r") as file:
-            try: return set(tuple(x) for x in json.load(file))
+# In-memory Settings
+SETTINGS = {
+    "is_running": False,
+    "speed": 12, # Default 12s
+    "msgs": ["Hi!", "Hello!", "Hey!", "Greetings!", "Yo!"], # Default 5 msgs
+    "success": 0
+}
+
+# Clients Setup
+clients = []
+for i, s in enumerate(SESSION_LIST):
+    cli = Client(f"worker_{i}", session_string=s, api_id=API_ID, api_hash=API_HASH)
+    clients.append(cli)
+
+# Primary Admin App
+app = clients[0] if clients else None
+
+# --- HELPERS ---
+def save_json(file, data):
+    with open(file, "w") as f:
+        json.dump(list(data), f, indent=4) # Line-by-line formatting
+
+def load_json(file):
+    if os.path.exists(file):
+        with open(file, "r") as f:
+            try:
+                d = json.load(f)
+                return set(tuple(x) for x in d)
             except: return set()
     return set()
 
-# --- ADMIN COMMANDS ---
+# --- COMMANDS ---
+
 @app.on_message(filters.command("start") & filters.user(ADMIN_ID))
 async def start_msg(c, m):
     text = (
-        "🚀 **Ultimate Multi-Worker UserBot**\n\n"
-        f"✅ **Workers:** {len(workers)}\n"
-        f"⏱ **Speed:** {SETTINGS['speed']}s\n\n"
-        "1️⃣ `/setmsgs` [Msg1 | Msg2 | Msg3 | Msg4 | Msg5]\n"
-        "2️⃣ `/scrape` @group 1000 (Direct list)\n"
-        "3️⃣ `/scrape_active` @group 1000 (History scan)\n"
-        "4️⃣ `/setspeed` 15 (Change speed)\n"
-        "5️⃣ `/send` | `/status` | `/stop` | `/sync`"
+        "🔥 **Ultimate Multi-Worker Bot V9**\n\n"
+        f"✅ **Workers Online:** {len(clients)}\n"
+        f"⏱ **Current Speed:** {SETTINGS['speed']}s\n\n"
+        "**1. Scraping:**\n"
+        "• `/scrape @group 1000` (Direct)\n"
+        "• `/scrape_active @group 1000` (History Scan)\n\n"
+        "**2. Messaging:**\n"
+        "• `/setmsg1 text...` (Set 5 different messages)\n"
+        "• `/speed 15` (Change delay)\n"
+        "• `/send` (Start Workers)\n\n"
+        "**3. Data:**\n"
+        "• `/dump` (Download & Auto-Delete for Render)\n"
+        "• `/status` | `/stop`"
     )
     await m.reply(text)
 
-@app.on_message(filters.command("setmsgs") & filters.user(ADMIN_ID))
+# Message Setup Commands (/setmsg1 to /setmsg5)
+@app.on_message(filters.command(["setmsg1", "setmsg2", "setmsg3", "setmsg4", "setmsg5"]) & filters.user(ADMIN_ID))
 async def set_msgs(c, m):
-    try:
-        content = m.text.split(None, 1)[1]
-        msgs = [msg.strip() for msg in content.split("|")]
-        if len(msgs) < 5: return await m.reply("❌ Kam se kam 5 messages '|' se separate karke likhein.")
-        SETTINGS["messages"] = msgs[:5]
-        await m.reply("✅ 5 Messages set ho gaye hain. Ab bot random use karega.")
-    except: await m.reply("❌ Usage: `/setmsgs Message 1 | Message 2 | Message 3...` ")
+    cmd = m.command[0]
+    idx = int(cmd[-1]) - 1
+    text = m.text.split(None, 1)[1]
+    SETTINGS["msgs"][idx] = text
+    await m.reply(f"✅ Message {idx+1} set: {text[:50]}...")
 
-@app.on_message(filters.command("setspeed") & filters.user(ADMIN_ID))
-async def set_speed(c, m):
+@app.on_message(filters.command("speed") & filters.user(ADMIN_ID))
+async def speed_cmd(c, m):
     try:
-        sp = int(m.text.split()[1])
-        SETTINGS["speed"] = sp
-        info = "🟢 Safe: 15s+ | 🟡 Risk: 10-12s | 🔴 High Risk: <8s"
-        await m.reply(f"⏱ Speed set to {sp}s.\n\n{info}")
-    except: await m.reply("Usage: `/setspeed 12` ")
+        s = int(m.command[1])
+        SETTINGS["speed"] = s
+        info = "🟢 Safe (Best)" if s >= 15 else "🟡 Moderate" if s >= 8 else "🔴 Risky (High Ban Risk)"
+        await m.reply(f"⏱ Speed set to {s}s.\nStatus: {info}")
+    except: await m.reply("Usage: `/speed 12`")
 
 @app.on_message(filters.command("scrape") & filters.user(ADMIN_ID))
-async def scrape_direct(c, m):
+async def scrape_normal(c, m):
     try:
         _, target, limit = m.text.split()
         if target.startswith("-") or target.isdigit(): target = int(target)
-        await m.reply("🔍 Scraping direct members list...")
-        scraped = load_json(USERS_DB)
+        await m.reply("🔍 Scraping members list...")
+        data = load_json(USERS_DB)
         count = 0
-        async for mem in c.get_chat_members(target):
+        async for member in c.get_chat_members(target):
             if count >= int(limit): break
-            if not mem.user.is_bot:
-                scraped.add((mem.user.id, mem.user.username or "N/A"))
-                count += 1
-        save_json(USERS_DB, scraped)
-        await m.reply(f"✅ Scraped: {count}. File created. Use `/download` to get it.")
-        # Data delete logic after sending file to admin
-        await c.send_document(m.chat.id, USERS_DB, caption="Backup. Data is now cleared from server.")
-        os.remove(USERS_DB) # Memory bachane ke liye delete
-    except Exception as e: await m.reply(f"Error: {e}")
+            if not member.user.is_bot:
+                u_info = (member.user.id, member.user.username or "N/A", member.user.first_name or "User")
+                if not any(u[0] == member.user.id for u in data):
+                    data.add(u_info)
+                    count += 1
+        save_json(USERS_DB, data)
+        await m.reply(f"✅ Scraped {count} users. Total: {len(data)}")
+    except Exception as e: await m.reply(f"❌ Error: {e}")
 
 @app.on_message(filters.command("scrape_active") & filters.user(ADMIN_ID))
-async def scrape_active(c, m):
+async def scrape_history(c, m):
     try:
         _, target, limit = m.text.split()
-        await m.reply("🔍 Scanning history for active users...")
-        scraped = load_json(USERS_DB)
+        await m.reply("🔍 Scanning chat history (for hidden members)...")
+        data = load_json(USERS_DB)
         count = 0
         async for msg in c.get_chat_history(target, limit=int(limit)):
             if msg.from_user and not msg.from_user.is_bot:
-                scraped.add((msg.from_user.id, msg.from_user.username or "N/A"))
-                count += 1
-        save_json(USERS_DB, scraped)
-        await m.reply(f"✅ Active Users: {count}")
-    except Exception as e: await m.reply(f"Error: {e}")
+                u_info = (msg.from_user.id, msg.from_user.username or "N/A", msg.from_user.first_name or "User")
+                if not any(u[0] == msg.from_user.id for u in data):
+                    data.add(u_info)
+                    count += 1
+        save_json(USERS_DB, data)
+        await m.reply(f"✅ Scraped {count} active users. Total: {len(data)}")
+    except Exception as e: await m.reply(f"❌ Error: {e}")
 
 @app.on_message(filters.command("send") & filters.user(ADMIN_ID))
 async def send_worker(c, m):
-    if not SETTINGS["messages"]: return await m.reply("❌ Pehle `/setmsgs` karein!")
     if SETTINGS["is_running"]: return await m.reply("⚠️ Already running!")
-    
     scraped, sent = list(load_json(USERS_DB)), load_json(SENT_DB)
     pending = [u for u in scraped if u[0] not in sent]
-    if not pending: return await m.reply("❌ No data! Upload USERS_DB first.")
+    
+    if not pending: return await m.reply("❌ No data found!")
+    
+    SETTINGS["is_running"], SETTINGS["success"] = True, 0
+    await m.reply(f"🚀 Workers started! Sending to {len(pending)} users...")
 
-    SETTINGS["is_running"] = True
-    await m.reply(f"🚀 Messaging started using {len(workers)} workers...")
-
-    worker_idx = 0
-    for user_id, username in pending:
+    cli_idx = 0
+    for user in pending:
         if not SETTINGS["is_running"]: break
         
-        # Select Worker
-        worker = workers[worker_idx]
+        worker = clients[cli_idx]
         try:
-            msg = random.choice(SETTINGS["messages"])
-            await worker.send_message(user_id, msg)
-            sent.add(user_id)
+            # Pick a random message from the 5 slots
+            random_msg = random.choice(SETTINGS["msgs"])
+            # Add personalization
+            final_msg = f"{random_msg}\n\nUser: {user[2]}"
+            
+            await worker.send_message(user[0], final_msg)
+            SETTINGS["success"] += 1
+            sent.add(user[0])
             save_json(SENT_DB, sent)
             
             # Rotate worker
-            worker_idx = (worker_idx + 1) % len(workers)
+            cli_idx = (cli_idx + 1) % len(clients)
             await asyncio.sleep(SETTINGS["speed"])
 
         except FloodWait as e:
-            worker_idx = (worker_idx + 1) % len(workers)
-            await asyncio.sleep(5)
+            await asyncio.sleep(e.value + 5)
+            cli_idx = (cli_idx + 1) % len(clients)
         except Exception: continue
 
     SETTINGS["is_running"] = False
-    await m.reply("🏁 Finished!")
+    await m.reply(f"🏁 Task Finished! Sent: {SETTINGS['success']}")
+
+@app.on_message(filters.command("dump") & filters.user(ADMIN_ID))
+async def dump_data(c, m):
+    await m.reply("📤 Sending database and clearing space...")
+    if os.path.exists(USERS_DB):
+        await m.reply_document(USERS_DB, caption="Total Scraped Users")
+        os.remove(USERS_DB) # Render storage bachaane ke liye delete
+    if os.path.exists(SENT_DB):
+        await m.reply_document(SENT_DB, caption="Sent History")
+        os.remove(SENT_DB)
+    await m.reply("🗑️ Files deleted from server to prevent crash.")
 
 @app.on_message(filters.command("status") & filters.user(ADMIN_ID))
 async def status_cmd(c, m):
     sc, sn = len(load_json(USERS_DB)), len(load_json(SENT_DB))
-    await m.reply(f"📊 Stats:\nDatabase: {sc}\nSent Already: {sn}\nWorkers: {len(workers)}")
+    await m.reply(f"📊 **Stats:**\nScraped: {sc}\nSent: {sn}\nWorkers: {len(clients)}\nSpeed: {SETTINGS['speed']}s")
 
 @app.on_message(filters.command("stop") & filters.user(ADMIN_ID))
 async def stop_cmd(c, m):
     SETTINGS["is_running"] = False
-    await m.reply("🛑 Stopped!")
+    await m.reply("🛑 All workers stopped.")
 
-@app.on_message(filters.command("sync") & filters.user(ADMIN_ID))
-async def sync_cmd(c, m):
-    sent = load_json(SENT_DB)
-    async for dialog in c.get_dialogs():
-        if dialog.chat.type == enums.ChatType.PRIVATE:
-            sent.add(dialog.chat.id)
-    save_json(SENT_DB, sent)
-    await m.reply("✅ Sent History Synced!")
+# Render Runner
+def run_web():
+    web_app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
 
-@app.on_message(filters.document & filters.user(ADMIN_ID))
-async def import_data(c, m):
-    await m.download(m.document.file_name)
-    await m.reply(f"✅ Imported {m.document.file_name}")
-
-def run_web(): web_app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+async def start_workers():
+    for cli in clients:
+        try: await cli.start()
+        except Exception as e: logger.error(f"Error: {e}")
 
 if __name__ == "__main__":
     Thread(target=run_web).start()
-    for w in workers: w.start()
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(start_workers())
     app.run()
