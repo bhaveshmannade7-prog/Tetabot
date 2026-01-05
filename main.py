@@ -17,6 +17,7 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 workers = []
 boss_client = None
 
+# 10 strings tak load karne ka logic
 for i in range(1, 11):
     session = os.getenv(f"STRING_{i}")
     if session:
@@ -27,20 +28,20 @@ for i in range(1, 11):
             logger.info(f"✅ Worker {i} loaded.")
             if boss_client is None:
                 boss_client = cli
-                logger.info(f"👑 Worker {i} assigned as Boss.")
+                logger.info(f"👑 Worker {i} assigned as Boss (Controller).")
         except Exception as e:
             logger.error(f"❌ Worker {i} failed: {e}")
 
 # Flask for Render
 web_app = Flask(__name__)
 @web_app.route('/')
-def home(): return "Multi-Worker Engine V13 is Online! ⚡"
+def home(): return "Multi-Worker Engine V13 is Active! ⚡"
 
 def run_web():
     port = int(os.getenv("PORT", 8080))
     web_app.run(host="0.0.0.0", port=port)
 
-# Database
+# Database Files
 USERS_DB, SENT_DB = "scraped_users.json", "sent_history.json"
 SETTINGS = {
     "is_running": False,
@@ -50,7 +51,6 @@ SETTINGS = {
 }
 
 def save_json(file, data):
-    # Convert set of tuples to list of lists for JSON
     with open(file, "w") as f:
         json.dump(list(data), f, indent=4)
 
@@ -63,25 +63,81 @@ def load_json(file):
             except: return set()
     return set()
 
+# --- BACKGROUND SENDER TASK ---
+async def start_messaging_task(c):
+    scraped, sent = list(load_json(USERS_DB)), load_json(SENT_DB)
+    pending = [u for u in scraped if u[0] not in sent]
+    
+    if not pending:
+        SETTINGS["is_running"] = False
+        await c.send_message(ADMIN_ID, "❌ Bhejne ke liye koi naya data nahi mila.")
+        return
+
+    await c.send_message(ADMIN_ID, f"🚀 Messaging Started! Targets: {len(pending)}")
+    
+    w_idx = 0
+    for user in pending:
+        if not SETTINGS["is_running"]: 
+            break
+        
+        try:
+            worker = workers[w_idx]
+            # 5 alag messages mein se random chunna
+            msg_text = f"{random.choice(SETTINGS['msgs'])}\n\nUser: {user[2]}"
+            
+            await worker.send_message(user[0], msg_text)
+            
+            SETTINGS["success"] += 1
+            sent.add(user[0])
+            save_json(SENT_DB, sent)
+            
+            # Worker rotate karna
+            w_idx = (w_idx + 1) % len(workers)
+            
+            # Default 12s + random variation for safety
+            await asyncio.sleep(SETTINGS["speed"] + random.uniform(1, 3))
+
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 5)
+            w_idx = (w_idx + 1) % len(workers)
+        except (PeerFlood, UserPrivacyRestricted):
+            continue
+        except Exception as e:
+            logger.error(f"Error in sending: {e}")
+            continue
+
+    SETTINGS["is_running"] = False
+    await c.send_message(ADMIN_ID, f"🏁 Campaign Finished! Total Sent: {SETTINGS['success']}")
+
 # --- BOT LOGIC (Boss Only) ---
 if boss_client:
     @boss_client.on_message(filters.command("start") & filters.user(ADMIN_ID))
     async def start_cmd(c, m):
         text = (
-            "🚀 **Ultimate Multi-Worker V13**\n\n"
+            "🚀 **Ultimate Multi-Worker V13 (PRO)**\n\n"
+            f"👑 **Controller:** STRING_1\n"
             f"✅ **Total Workers:** {len(workers)}\n"
             f"⏱ **Current Speed:** {SETTINGS['speed']}s\n\n"
-            "📍 `/scrape` | `/scrape_active` | `/send`\n"
-            "📍 `/status` | `/stop` | `/dump` | `/sync`"
+            "📍 `/scrape @group 1000` | `/scrape_active @group 1000`\n"
+            "📍 `/setmsg1 Text...` (Upto 5 Slots)\n"
+            "📍 `/send` | `/status` | `/stop` | `/dump` | `/sync`"
         )
         await m.reply(text)
 
     @boss_client.on_message(filters.command(["setmsg1", "setmsg2", "setmsg3", "setmsg4", "setmsg5"]) & filters.user(ADMIN_ID))
     async def set_msgs(c, m):
         idx = int(m.command[0][-1]) - 1
-        if len(m.text.split()) < 2: return await m.reply("Kripya message likhein.")
+        if len(m.text.split()) < 2: return await m.reply("Usage: `/setmsg1 Hello User` ")
         SETTINGS["msgs"][idx] = m.text.split(None, 1)[1]
-        await m.reply(f"✅ Slot {idx+1} Updated!")
+        await m.reply(f"✅ Slot {idx+1} Updated.")
+
+    @boss_client.on_message(filters.command("speed") & filters.user(ADMIN_ID))
+    async def speed_cmd(c, m):
+        try:
+            s = int(m.command[1])
+            SETTINGS["speed"] = s
+            await m.reply(f"⏱ Speed set to {s}s. (Min 8s recommended)")
+        except: pass
 
     @boss_client.on_message(filters.command("scrape_active") & filters.user(ADMIN_ID))
     async def scrape_history(c, m):
@@ -89,7 +145,8 @@ if boss_client:
             parts = m.text.split()
             target, limit = parts[1], int(parts[2])
             if target.startswith("-") or target.isdigit(): target = int(target)
-            await m.reply(f"🔍 Scrape chalu: `{target}`")
+            
+            await m.reply(f"🔍 `{target}` scanning history...")
             data = load_json(USERS_DB)
             count = 0
             async for msg in c.get_chat_history(target, limit=limit):
@@ -99,69 +156,36 @@ if boss_client:
                         data.add(u_info)
                         count += 1
             save_json(USERS_DB, data)
+            await m.reply(f"✅ Scraped Active: {count} | Total: {len(data)}")
+        except Exception as e: await m.reply(f"❌ Error: {e}")
+
+    @boss_client.on_message(filters.command("scrape") & filters.user(ADMIN_ID))
+    async def scrape_normal(c, m):
+        try:
+            parts = m.text.split()
+            target, limit = parts[1], int(parts[2])
+            if target.startswith("-") or target.isdigit(): target = int(target)
+            await m.reply(f"🔍 `{target}` scraping members...")
+            data = load_json(USERS_DB)
+            count = 0
+            async for member in c.get_chat_members(target):
+                if count >= limit: break
+                if not member.user.is_bot:
+                    u_info = (member.user.id, member.user.username or "N/A", member.user.first_name or "User")
+                    if not any(u[0] == member.user.id for u in data):
+                        data.add(u_info)
+                        count += 1
+            save_json(USERS_DB, data)
             await m.reply(f"✅ Scraped: {count} | Total: {len(data)}")
         except Exception as e: await m.reply(f"❌ Error: {e}")
 
     @boss_client.on_message(filters.command("send") & filters.user(ADMIN_ID))
-    async def send_worker(c, m):
-        if SETTINGS["is_running"]: return await m.reply("⚠️ Already running!")
-        
-        scraped = load_json(USERS_DB)
-        sent_history = load_json(SENT_DB)
-        # Extract user IDs for easy checking
-        sent_ids = {u[0] for u in sent_history}
-        pending = [u for u in scraped if u[0] not in sent_ids]
-
-        if not pending: return await m.reply("❌ No pending users to send!")
-
+    async def send_worker_cmd(c, m):
+        if SETTINGS["is_running"]: return await m.reply("⚠️ Campaign already running!")
         SETTINGS["is_running"] = True
         SETTINGS["success"] = 0
-        await m.reply(f"🚀 Workers started for {len(pending)} users...")
-
-        w_idx = 0
-        for user in pending:
-            if not SETTINGS["is_running"]: break
-            
-            # Select Worker
-            worker = workers[w_idx]
-            user_id, user_name, first_name = user
-            
-            try:
-                # Random Message selection
-                base_msg = random.choice(SETTINGS["msgs"])
-                await worker.send_message(user_id, f"{base_msg}")
-                
-                # Update stats and history
-                SETTINGS["success"] += 1
-                sent_history.add((user_id, user_name, first_name))
-                save_json(SENT_DB, sent_history)
-                
-                # Rotate worker index
-                w_idx = (w_idx + 1) % len(workers)
-                
-                # Delay
-                await asyncio.sleep(SETTINGS["speed"])
-
-            except FloodWait as e:
-                logger.warning(f"FloodWait on {worker.name}: {e.value}s")
-                await asyncio.sleep(e.value + 1)
-                w_idx = (w_idx + 1) % len(workers)
-            except (PeerFlood, UserPrivacyRestricted):
-                w_idx = (w_idx + 1) % len(workers)
-                continue
-            except Exception as e:
-                logger.error(f"Error sending to {user_id}: {e}")
-                w_idx = (w_idx + 1) % len(workers)
-                continue
-
-        SETTINGS["is_running"] = False
-        await m.reply(f"🏁 Finish! Sent to: {SETTINGS['success']} users.")
-
-    @boss_client.on_message(filters.command("status") & filters.user(ADMIN_ID))
-    async def status_cmd(c, m):
-        sc = len(load_json(USERS_DB))
-        sn = len(load_json(SENT_DB))
-        await m.reply(f"📊 Stats:\n- Scraped: {sc}\n- Sent: {sn}\n- Workers: {len(workers)}")
+        # Background mein task shuru karna
+        asyncio.create_task(start_messaging_task(c))
 
     @boss_client.on_message(filters.command("dump") & filters.user(ADMIN_ID))
     async def dump_cmd(c, m):
@@ -169,21 +193,43 @@ if boss_client:
             if os.path.exists(db):
                 await m.reply_document(db)
                 os.remove(db)
-        await m.reply("🗑️ Cleared.")
+        await m.reply("🗑️ Server space cleared.")
+
+    @boss_client.on_message(filters.command("sync") & filters.user(ADMIN_ID))
+    async def sync_cmd(c, m):
+        await m.reply("🔄 Syncing history...")
+        sent = load_json(SENT_DB)
+        async for dialog in c.get_dialogs():
+            if dialog.chat.type == enums.ChatType.PRIVATE:
+                sent.add(dialog.chat.id)
+        save_json(SENT_DB, sent)
+        await m.reply(f"✅ Sync Done! History size: {len(sent)}")
+
+    @boss_client.on_message(filters.command("status") & filters.user(ADMIN_ID))
+    async def status_cmd(c, m):
+        sc, sn = len(load_json(USERS_DB)), len(load_json(SENT_DB))
+        await m.reply(f"📊 Stats:\nScraped: {sc}\nSent: {sn}\nWorkers: {len(workers)}\nRunning: {SETTINGS['is_running']}")
 
     @boss_client.on_message(filters.command("stop") & filters.user(ADMIN_ID))
     async def stop_cmd(c, m):
         SETTINGS["is_running"] = False
-        await m.reply("🛑 Stopped!")
+        await m.reply("🛑 Messaging campaign stopped.")
 
-# --- EXECUTION ---
-async def start_all():
+# --- RUNNER ---
+async def main():
     Thread(target=run_web).start()
+    if not workers:
+        logger.error("No strings found.")
+        return
+
     for cli in workers:
         await cli.start()
-        try: await cli.send_message(ADMIN_ID, f"✅ {cli.name} Ready")
+        try: await cli.send_message(ADMIN_ID, f"✅ Worker {cli.name} is Online!")
         except: pass
+    
+    logger.info(">>> Bot is fully started and listening.")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    asyncio.run(start_all())
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
