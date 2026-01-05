@@ -12,41 +12,39 @@ logger = logging.getLogger(__name__)
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-RAW_SESSIONS = os.getenv("SESSIONS", "")
-SESSION_LIST = [s.strip() for s in RAW_SESSIONS.split(",") if s.strip()]
 
-# Flask for Render Port Binding
+# Render Envs se 10 Strings tak load karne ka logic
+clients = []
+for i in range(1, 11):
+    session = os.getenv(f"STRING_{i}")
+    if session:
+        try:
+            cli = Client(f"worker_{i}", session_string=session.strip(), api_id=API_ID, api_hash=API_HASH)
+            clients.append(cli)
+            logger.info(f"✅ Worker {i} initialized.")
+        except Exception as e:
+            logger.error(f"❌ Worker {i} error: {e}")
+
+# Admin app (Pehla worker controller banega)
+app = clients[0] if clients else None
+
 web_app = Flask(__name__)
 @web_app.route('/')
-def home(): return "Multi-Worker Bot V9 is Online! ⚡"
+def home(): return "Multi-Worker Engine V10 is Online! ⚡"
 
 def run_web():
     port = int(os.getenv("PORT", 8080))
     web_app.run(host="0.0.0.0", port=port)
 
-# Files
+# Database Files
 USERS_DB, SENT_DB = "scraped_users.json", "sent_history.json"
 
-# In-memory Global Settings
 SETTINGS = {
     "is_running": False,
     "speed": 12,
     "msgs": ["Hi!", "Hello!", "Hey!", "Greetings!", "Yo!"], 
     "success": 0
 }
-
-# Clients/Workers Setup
-clients = []
-for i, s in enumerate(SESSION_LIST):
-    try:
-        cli = Client(f"worker_{i}", session_string=s, api_id=API_ID, api_hash=API_HASH)
-        clients.append(cli)
-        logger.info(f"✅ Worker {i} initialized.")
-    except Exception as e:
-        logger.error(f"❌ Worker {i} error: {e}")
-
-# Admin app (First worker is used as controller)
-app = clients[0] if clients else None
 
 def save_json(file, data):
     with open(file, "w") as f:
@@ -61,33 +59,33 @@ def load_json(file):
             except: return set()
     return set()
 
-# --- COMMANDS (Only if app is not None) ---
 if app:
     @app.on_message(filters.command("start") & filters.user(ADMIN_ID))
     async def start_msg(c, m):
         text = (
-            "🔥 **Ultimate Multi-Worker Bot V9**\n\n"
-            f"✅ **Workers Online:** {len(clients)}\n"
+            "🚀 **Ultimate Multi-Worker V10**\n\n"
+            f"✅ **Active Workers:** {len(clients)}/10\n"
             f"⏱ **Current Speed:** {SETTINGS['speed']}s\n\n"
-            "**Scraping:**\n"
+            "📍 **Scraping:**\n"
             "• `/scrape @group 1000` (Direct)\n"
             "• `/scrape_active @group 1000` (History Scan)\n\n"
-            "**Messaging:**\n"
+            "📍 **Messaging:**\n"
             "• `/setmsg1 Text...` (Set 5 slots)\n"
-            "• `/speed 15` (Fast/Safe setting)\n"
+            "• `/speed 15` (Delay change)\n"
             "• `/send` (Start Workers)\n\n"
-            "**Data:**\n"
-            "• `/dump` (Download & Delete)\n"
-            "• `/status` | `/stop`"
+            "📍 **Data Management:**\n"
+            "• `/dump` (Download & Delete for Render Safety)\n"
+            "• `/status` | `/stop` | `/sync`"
         )
         await m.reply(text)
 
+    # Message Setup Commands (/setmsg1 to /setmsg5)
     @app.on_message(filters.command(["setmsg1", "setmsg2", "setmsg3", "setmsg4", "setmsg5"]) & filters.user(ADMIN_ID))
     async def set_msgs(c, m):
         idx = int(m.command[0][-1]) - 1
         if len(m.text.split()) < 2: return await m.reply("Kripya text likhein.")
         SETTINGS["msgs"][idx] = m.text.split(None, 1)[1]
-        await m.reply(f"✅ Message slot {idx+1} set!")
+        await m.reply(f"✅ Message slot {idx+1} set ho gaya!")
 
     @app.on_message(filters.command("speed") & filters.user(ADMIN_ID))
     async def speed_cmd(c, m):
@@ -138,35 +136,40 @@ if app:
         if SETTINGS["is_running"]: return await m.reply("⚠️ Already running!")
         scraped, sent = list(load_json(USERS_DB)), load_json(SENT_DB)
         pending = [u for u in scraped if u[0] not in sent]
-        if not pending: return await m.reply("❌ No data!")
+        if not pending: return await m.reply("❌ No data found!")
         
         SETTINGS["is_running"], SETTINGS["success"] = True, 0
-        await m.reply(f"🚀 Workers started with speed {SETTINGS['speed']}s")
+        await m.reply(f"🚀 Workers started with {len(clients)} accounts.")
 
         cli_idx = 0
         for user in pending:
             if not SETTINGS["is_running"]: break
             worker = clients[cli_idx]
             try:
+                # Pick a random message from 5 slots
                 final_msg = f"{random.choice(SETTINGS['msgs'])}\n\nUser: {user[2]}"
                 await worker.send_message(user[0], final_msg)
+                
                 SETTINGS["success"] += 1
                 sent.add(user[0])
                 save_json(SENT_DB, sent)
+                
+                # Rotate worker
                 cli_idx = (cli_idx + 1) % len(clients)
                 await asyncio.sleep(SETTINGS["speed"])
+
             except FloodWait as e:
                 await asyncio.sleep(e.value + 5)
                 cli_idx = (cli_idx + 1) % len(clients)
             except Exception: continue
 
         SETTINGS["is_running"] = False
-        await m.reply(f"🏁 Done! Sent: {SETTINGS['success']}")
+        await m.reply(f"🏁 Task Finished! Sent: {SETTINGS['success']}")
 
     @app.on_message(filters.command("dump") & filters.user(ADMIN_ID))
     async def dump_cmd(c, m):
         if os.path.exists(USERS_DB):
-            await m.reply_document(USERS_DB, caption="Scraped Data")
+            await m.reply_document(USERS_DB, caption="Total Scraped Users")
             os.remove(USERS_DB)
         if os.path.exists(SENT_DB):
             await m.reply_document(SENT_DB, caption="Sent History")
@@ -183,13 +186,21 @@ if app:
         SETTINGS["is_running"] = False
         await m.reply("🛑 Stopped!")
 
-# --- EXECUTION ---
-def run_web():
-    web_app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+    @app.on_message(filters.command("sync") & filters.user(ADMIN_ID))
+    async def sync_history(c, m):
+        sent = load_json(SENT_DB)
+        async for dialog in c.get_dialogs():
+            if dialog.chat.type == enums.ChatType.PRIVATE:
+                sent.add(dialog.chat.id)
+        save_json(SENT_DB, sent)
+        await m.reply("✅ Sync Done.")
 
+# --- EXECUTION ---
 async def start_workers():
     for cli in clients:
-        try: await cli.start()
+        try:
+            await cli.start()
+            await cli.send_message(ADMIN_ID, "✅ Worker Online!")
         except: pass
 
 if __name__ == "__main__":
@@ -197,7 +208,6 @@ if __name__ == "__main__":
     if clients:
         loop = asyncio.get_event_loop()
         loop.run_until_complete(start_workers())
-        logger.info(">>> Workers Online.")
         app.run()
     else:
-        logger.error(">>> NO SESSIONS FOUND. Bot will not start.")
+        logger.error(">>> NO SESSIONS FOUND. Please check STRING_1 to STRING_10.")
