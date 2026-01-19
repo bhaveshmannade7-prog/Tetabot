@@ -1,3 +1,4 @@
 pyrogram
 tgcrypto
-flask
+python-dotenv
+uvloop; platform_system != "Windows"
