@@ -1,5 +1,20 @@
 import asyncio
 import os
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot Running")
+
+def start_web():
+    server = HTTPServer(('0.0.0.0', 8080), SimpleHandler)
+    server.serve_forever()
+
+Thread(target=start_web).start()
+
 from pyrogram import Client, filters, idle
 from config import Config
 from core.database import Database
